@@ -33,7 +33,8 @@ async function getGoogleAccessToken() {
 // ------------------ CREATE CONTACT ------------------
 
 async function createGoogleContact(prospect) {
-  if (!prospect?.phone && !prospect?.email) return;
+  // Only create a contact if phone exists
+  if (!prospect?.phone) return;
 
   const token = await getGoogleAccessToken();
 
@@ -45,13 +46,11 @@ async function createGoogleContact(prospect) {
       },
     ],
 
-    emailAddresses: prospect.email
-      ? [{ value: prospect.email }]
-      : [],
+    // Optional: keep email if present
+    emailAddresses: prospect.email ? [{ value: prospect.email }] : [],
 
-    phoneNumbers: prospect.phone
-      ? [{ value: prospect.phone }]
-      : [],
+    // Required: phone must exist (we already checked)
+    phoneNumbers: [{ value: prospect.phone }],
 
     biographies: [
       {
@@ -60,17 +59,14 @@ async function createGoogleContact(prospect) {
     ],
   };
 
-  const r = await fetch(
-    "https://people.googleapis.com/v1/people:createContact",
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(body),
-    }
-  );
+  const r = await fetch("https://people.googleapis.com/v1/people:createContact", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+  });
 
   const data = await r.json();
 
