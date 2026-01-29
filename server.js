@@ -4,6 +4,30 @@ import fetch from "node-fetch";
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
+// ------------------ HELPERS ------------------
+
+function normalizePhone(p) {
+  if (!p) return "";
+
+  let s = String(p).trim();
+  const hasPlus = s.startsWith("+");
+
+  s = s.replace(/[^\d]/g, "");
+
+  return hasPlus ? `+${s}` : s;
+}
+
+// Phone FIRST, then email
+function bestQueryKey(prospect) {
+  const phone = normalizePhone(prospect?.phone);
+  if (phone) return { type: "phone", value: phone };
+
+  const email = (prospect?.email || "").trim().toLowerCase();
+  if (email) return { type: "email", value: email };
+
+  return null;
+}
+
 // ------------------ GOOGLE AUTH ------------------
 
 async function getGoogleAccessToken() {
@@ -16,7 +40,9 @@ async function getGoogleAccessToken() {
 
   const r = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
     body: params.toString(),
   });
 
@@ -24,48 +50,108 @@ async function getGoogleAccessToken() {
 
   if (!r.ok) {
     console.error("Google token error:", data);
-    throw new Error("Failed to refresh token");
+    throw new Error("Failed to refresh Google token");
   }
 
   return data.access_token;
 }
 
-// ------------------ CREATE CONTACT ------------------
+// ------------------ SEARCH CONTACT ------------------
 
-async function createGoogleContact(prospect) {
-  if (!prospect?.phone && !prospect?.email) return;
+async function searchGoogleContact(query, accessToken) {
+  const url =
+    "https://people.googleapis.com/v1/people:searchContacts" +
+    `?query=${encodeURIComponent(query)}` +
+    "&readMask=names,emailAddresses,phoneNumbers,biographies" +
+    "&pageSize=10";
 
-  const token = await getGoogleAccessToken();
+  const r = await fetch(url, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+    },
+  });
+
+  const data = await r.json();
+
+  if (!r.ok) {
+    console.error("Search error:", data);
+    throw new Error("Failed to search contacts");
+  }
+
+  return data?.results?.[0]?.person || null;
+}
+
+// ------------------ UPSERT CONTACT ------------------
+
+async function upsertGoogleContact(prospect) {
+  const key = bestQueryKey(prospect);
+
+  if (!key) return;
+
+  const accessToken = await getGoogleAccessToken();
 
   const body = {
     names: [
       {
-        givenName: prospect.first_name || "",
-        familyName: prospect.last_name || "",
+        givenName: prospect?.first_name || "",
+        familyName: prospect?.last_name || "",
       },
     ],
 
-    emailAddresses: prospect.email
-      ? [{ value: prospect.email }]
+    emailAddresses: prospect?.email
+      ? [{ value: prospect.email.trim().toLowerCase() }]
       : [],
 
-    phoneNumbers: prospect.phone
-      ? [{ value: prospect.phone }]
+    phoneNumbers: prospect?.phone
+      ? [{ value: normalizePhone(prospect.phone) }]
       : [],
 
     biographies: [
       {
-        value: `Source: Bonzo | ID: ${prospect.id}`,
+        value: `Source: Bonzo | ID: ${prospect?.id || ""}`,
       },
     ],
   };
 
+  const existing = await searchGoogleContact(
+    key.value,
+    accessToken
+  );
+
+  // ---------- UPDATE ----------
+  if (existing?.resourceName && existing?.etag) {
+    const updateUrl =
+      `https://people.googleapis.com/v1/${existing.resourceName}` +
+      "?updatePersonFields=names,emailAddresses,phoneNumbers,biographies";
+
+    const r = await fetch(updateUrl, {
+      method: "PATCH",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+        "If-Match": existing.etag,
+      },
+      body: JSON.stringify(body),
+    });
+
+    const data = await r.json();
+
+    if (!r.ok) {
+      console.error("Update error:", data);
+      throw new Error("Failed to update contact");
+    }
+
+    console.log("Updated contact:", data.resourceName);
+    return;
+  }
+
+  // ---------- CREATE ----------
   const r = await fetch(
     "https://people.googleapis.com/v1/people:createContact",
     {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${token}`,
+        Authorization: `Bearer ${accessToken}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(body),
@@ -75,11 +161,11 @@ async function createGoogleContact(prospect) {
   const data = await r.json();
 
   if (!r.ok) {
-    console.error("People API error:", data);
+    console.error("Create error:", data);
     throw new Error("Failed to create contact");
   }
 
-  return data;
+  console.log("Created contact:", data.resourceName);
 }
 
 // ------------------ WEBHOOK ------------------
@@ -99,11 +185,7 @@ app.post("/bonzo/events", async (req, res) => {
     if (
       ["prospects.created", "prospects.updated"].includes(event)
     ) {
-      const result = await createGoogleContact(prospect);
-
-      if (result) {
-        console.log("Google contact created:", result.resourceName);
-      }
+      await upsertGoogleContact(prospect);
     }
 
     res.status(200).json({ ok: true });
