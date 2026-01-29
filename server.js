@@ -26,6 +26,11 @@ function bestQueryKey(prospect) {
   return null;
 }
 
+function ensurePeopleResourceName(resourceName) {
+  if (!resourceName) return resourceName;
+  return resourceName.startsWith("people/") ? resourceName : `people/${resourceName}`;
+}
+
 // Safely read responses that might be HTML (not JSON)
 async function readJsonOrText(r) {
   const text = await r.text();
@@ -117,8 +122,10 @@ async function upsertGoogleContact(prospect) {
 
   // ---------- UPDATE ----------
   if (existing?.resourceName && existing?.etag) {
+    const rn = ensurePeopleResourceName(existing.resourceName);
+
     const updateUrl =
-      `https://people.googleapis.com/v1/${existing.resourceName}` +
+      `https://people.googleapis.com/v1/${rn}` +
       "?updatePersonFields=names,emailAddresses,phoneNumbers,biographies";
 
     const r = await fetch(updateUrl, {
