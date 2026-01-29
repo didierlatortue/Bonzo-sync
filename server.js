@@ -34,7 +34,8 @@ async function getGoogleAccessToken() {
 
 async function createGoogleContact(prospect) {
   // Only create a contact if phone exists
-  if (!prospect?.phone) return;
+  const phone = (prospect?.phone || "").trim();
+  if (!phone) return;
 
   const token = await getGoogleAccessToken();
 
@@ -46,11 +47,17 @@ async function createGoogleContact(prospect) {
       },
     ],
 
-    // Optional: keep email if present
+    organizations: [
+      {
+        name: "Home Loans",     // <-- Company line
+        type: "work",
+        primary: true,
+      },
+    ],
+
     emailAddresses: prospect.email ? [{ value: prospect.email }] : [],
 
-    // Required: phone must exist (we already checked)
-    phoneNumbers: [{ value: prospect.phone }],
+    phoneNumbers: [{ value: phone }],
 
     biographies: [
       {
@@ -77,7 +84,6 @@ async function createGoogleContact(prospect) {
 
   return data;
 }
-
 // ------------------ WEBHOOK ------------------
 
 app.post("/bonzo/events", async (req, res) => {
