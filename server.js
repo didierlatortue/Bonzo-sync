@@ -4,6 +4,44 @@ import fetch from "node-fetch";
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
+// ------------------ HELPERS ------------------
+
+function normalizePhone(p) {
+  if (!p) return "";
+  let s = String(p).trim();
+
+  // keep leading + if present, strip everything else to digits
+  const hasPlus = s.startsWith("+");
+  s = s.replace(/[^\d]/g, "");
+
+  return hasPlus ? `+${s}` : s;
+}
+
+// Phone first, then email
+function bestQueryKey(prospect) {
+  const phone = normalizePhone(prospect?.phone);
+  if (phone) return { type: "phone", value: phone };
+
+  const email = (prospect?.email || "").trim().toLowerCase();
+  if (email) return { type: "email", value: email };
+
+  return null;
+}
+
+function ensurePeopleResourceName(resourceName) {
+  if (!resourceName) return resourceName;
+  return resourceName.startsWith("people/") ? resourceName : `people/${resourceName}`;
+}
+
+async function readJsonOrText(r) {
+  const text = await r.text();
+  try {
+    return { ok: r.ok, status: r.status, json: JSON.parse(text), text: null };
+  } catch {
+    return { ok: r.ok, status: r.status, json: null, text };
+  }
+}
+
 // ------------------ GOOGLE AUTH ------------------
 
 async function getGoogleAccessToken() {
@@ -20,92 +58,135 @@ async function getGoogleAccessToken() {
     body: params.toString(),
   });
 
-  const data = await r.json();
+  const out = await readJsonOrText(r);
 
-  if (!r.ok) {
-    console.error("Google token error:", data);
+  if (!out.ok) {
+    console.error("Google token error:", out.status, out.json || out.text);
     throw new Error("Failed to refresh token");
   }
 
-  return data.access_token;
+  return out.json.access_token;
 }
 
-// ------------------ CREATE CONTACT ------------------
+// ------------------ SEARCH CONTACT ------------------
 
-async function createGoogleContact(prospect) {
-  // Only create a contact if phone exists
-  const phone = (prospect?.phone || "").trim();
+async function searchGoogleContact(query, accessToken) {
+  const url =
+    "https://people.googleapis.com/v1/people:searchContacts" +
+    `?query=${encodeURIComponent(query)}` +
+    "&readMask=names,emailAddresses,phoneNumbers,biographies" +
+    "&pageSize=10";
+
+  const r = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+
+  const out = await readJsonOrText(r);
+
+  if (!out.ok) {
+    console.error("searchContacts failed:", out.status, out.json || out.text);
+    throw new Error("Failed to search contacts");
+  }
+
+  return out.json?.results?.[0]?.person || null;
+}
+
+// ------------------ UPSERT (NO DUPES) ------------------
+
+async function upsertGoogleContact(prospect) {
+  // Your rule: ONLY sync if phone exists
+  const phone = normalizePhone(prospect?.phone);
   if (!phone) return;
 
-  const token = await getGoogleAccessToken();
+  const key = bestQueryKey(prospect);
+  if (!key) return;
+
+  const accessToken = await getGoogleAccessToken();
 
   const body = {
     names: [
       {
-        givenName: prospect.first_name || "",
-        familyName: prospect.last_name || "",
+        givenName: prospect?.first_name || "",
+        familyName: prospect?.last_name || "",
       },
     ],
-
-    organizations: [
-      {
-        name: "Home Loans",     // <-- Company line
-        type: "work",
-        primary: true,
-      },
-    ],
-
-    emailAddresses: prospect.email ? [{ value: prospect.email }] : [],
-
+    emailAddresses: prospect?.email
+      ? [{ value: prospect.email.trim().toLowerCase() }]
+      : [],
     phoneNumbers: [{ value: phone }],
-
     biographies: [
       {
-        value: `Source: Bonzo | ID: ${prospect.id}`,
+        value: `Source: Bonzo | ID: ${prospect?.id || ""}`,
       },
     ],
   };
 
+  const existing = await searchGoogleContact(key.value, accessToken);
+
+  // ---------- UPDATE ----------
+  if (existing?.resourceName && existing?.etag) {
+    const rn = ensurePeopleResourceName(existing.resourceName);
+
+    const updateUrl =
+      `https://people.googleapis.com/v1/${rn}` +
+      "?updatePersonFields=names,emailAddresses,phoneNumbers,biographies";
+
+    const r = await fetch(updateUrl, {
+      method: "PATCH",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+        "If-Match": existing.etag,
+      },
+      body: JSON.stringify(body),
+    });
+
+    const out = await readJsonOrText(r);
+
+    if (!out.ok) {
+      console.error("updateContact failed:", out.status, out.json || out.text);
+      throw new Error("Failed to update contact");
+    }
+
+    console.log("Updated Google contact:", out.json.resourceName);
+    return out.json;
+  }
+
+  // ---------- CREATE ----------
   const r = await fetch("https://people.googleapis.com/v1/people:createContact", {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${token}`,
+      Authorization: `Bearer ${accessToken}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify(body),
   });
 
-  const data = await r.json();
+  const out = await readJsonOrText(r);
 
-  if (!r.ok) {
-    console.error("People API error:", data);
+  if (!out.ok) {
+    console.error("createContact failed:", out.status, out.json || out.text);
     throw new Error("Failed to create contact");
   }
 
-  return data;
+  console.log("Created Google contact:", out.json.resourceName);
+  return out.json;
 }
+
 // ------------------ WEBHOOK ------------------
 
 app.post("/bonzo/events", async (req, res) => {
   try {
     const code = req.header("x-bonzo-code");
-
     if (code !== process.env.BONZO_CODE) {
       return res.status(401).send("Unauthorized");
     }
 
     const { event, prospect } = req.body;
-
     console.log("Bonzo event:", event);
 
-    if (
-      ["prospects.created", "prospects.updated"].includes(event)
-    ) {
-      const result = await createGoogleContact(prospect);
-
-      if (result) {
-        console.log("Google contact created:", result.resourceName);
-      }
+    if (["prospects.created", "prospects.updated"].includes(event)) {
+      await upsertGoogleContact(prospect);
     }
 
     res.status(200).json({ ok: true });
