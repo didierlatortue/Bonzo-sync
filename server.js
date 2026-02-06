@@ -45,6 +45,26 @@ async function readJsonOrText(r) {
     return { ok: r.ok, status: r.status, json: null, text };
   }
 }
+// adding helper for robocallers
+function nameLooksLikePhone(first, last) {
+  const full = `${first || ""} ${last || ""}`.trim();
+
+  if (!full) return true;
+
+  // Remove spaces, dashes, parentheses
+  const cleaned = full.replace(/[\s\-\(\)]/g, "");
+
+  // If it's mostly digits, it's probably a phone
+  const digitCount = (cleaned.match(/\d/g) || []).length;
+
+  // More than 70% digits = phone/spam
+  if (digitCount / cleaned.length > 0.7) return true;
+
+  // All digits
+  if (/^\d+$/.test(cleaned)) return true;
+
+  return false;
+}
 
 // ------------------ GOOGLE AUTH ------------------
 
@@ -179,6 +199,17 @@ async function findExistingContact(prospect, accessToken) {
 // ------------------ UPSERT (NO DUPES) ------------------
 
 async function upsertGoogleContact(prospect) {
+  // ❌ Skip if the "name" looks like a phone number (spam/unknown caller behavior)
+  if (nameLooksLikePhone(prospect?.first_name, prospect?.last_name)) {
+    console.log("Skipping number-as-name contact", {
+      first: prospect?.first_name,
+      last: prospect?.last_name,
+      phone: prospect?.phone,
+      id: prospect?.id,
+    });
+    return;
+  }
+
   const phoneStored = normalizePhoneForStore(prospect?.phone);
   const phoneDigits = digitsOnly(phoneStored);
   if (!phoneDigits) return;
@@ -198,6 +229,9 @@ async function upsertGoogleContact(prospect) {
     biographies: [{ value: `Source: Bonzo | ID: ${prospect?.id || ""}` }],
     organizations: [{ name: "Home Loans", title: "Lead" }],
   };
+
+  // ... keep the rest of your update/create logic exactly as-is below ...
+}
 
   const found = await findExistingContact(prospect, accessToken);
 
