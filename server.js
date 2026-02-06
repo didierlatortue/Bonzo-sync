@@ -231,6 +231,9 @@ if (found?.resourceName) {
   // person.resourceName should already look like: "people/XXXXXXXX"
   const rn = person.resourceName;
 
+console.log("Updating resourceName:", rn);
+console.log("Update URL:", updateUrl);
+  
   const updateUrl =
     `https://people.googleapis.com/v1/${rn}:updateContact` +
     "?updatePersonFields=names,emailAddresses,phoneNumbers,biographies,organizations";
