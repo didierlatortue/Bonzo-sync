@@ -80,7 +80,7 @@ async function searchGoogleContacts(query, accessToken) {
   const url =
     "https://people.googleapis.com/v1/people:searchContacts" +
     `?query=${encodeURIComponent(query)}` +
-    "&readMask=names,emailAddresses,phoneNumbers,biographies,resourceName" +
+    "&readMask=names,emailAddresses,phoneNumbers,biographies,metadata" +
     "&pageSize=10";
 
   const r = await fetch(url, {
