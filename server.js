@@ -33,11 +33,6 @@ function last10Digits(d) {
   return s.slice(-10);
 }
 
-function ensurePeopleResourceName(resourceName) {
-  if (!resourceName) return resourceName;
-  return resourceName.startsWith("people/") ? resourceName : `people/${resourceName}`;
-}
-
 async function readJsonOrText(r) {
   const text = await r.text();
   try {
@@ -229,47 +224,48 @@ async function upsertGoogleContact(prospect) {
   // 1) Find existing with VERIFIED matching
   const found = await findExistingContact(prospect, accessToken);
 
-  // ---------- UPDATE ----------
-  if (found?.resourceName) {
-    // 2) GET person to obtain fresh etag (PATCH If-Match is safer with a real etag)
-    const full = await getPerson(found.resourceName, accessToken);
-    const rn = ensurePeopleResourceName(full.resourceName);
+// ---------- UPDATE ----------
+if (found?.resourceName) {
+  const person = await getPerson(found.resourceName, accessToken);
 
-    const updateUrl =
-      `https://people.googleapis.com/v1/${rn}:updateConact` +
-      "?updatePersonFields=names,emailAddresses,phoneNumbers,biographies,organizations";
+  // person.resourceName should already look like: "people/XXXXXXXX"
+  const rn = person.resourceName;
 
-    // Try once; if we get 412 (etag mismatch), refetch etag and retry once
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      const etag = attempt === 1 ? full.etag : (await getPerson(rn, accessToken)).etag;
+  const updateUrl =
+    `https://people.googleapis.com/v1/${rn}:updateContact` +
+    "?updatePersonFields=names,emailAddresses,phoneNumbers,biographies,organizations";
 
-      const r = await fetch(updateUrl, {
-        method: "PATCH",
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-          ...(etag ? { "If-Match": etag } : {}),
-        },
-        body: JSON.stringify(body),
-      });
+  // Try once; if we get 412 (etag mismatch), refetch etag and retry once
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const etag =
+      attempt === 1 ? person.etag : (await getPerson(rn, accessToken)).etag;
 
-      const out = await readJsonOrText(r);
+    const r = await fetch(updateUrl, {
+      method: "PATCH",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+        ...(etag ? { "If-Match": etag } : {}),
+      },
+      body: JSON.stringify(body),
+    });
 
-      if (out.ok) {
-        console.log("Updated Google contact:", out.json.resourceName);
-        return out.json;
-      }
+    const out = await readJsonOrText(r);
 
-      // If etag conflict, retry once
-      if (out.status === 412 && attempt === 1) {
-        console.warn("ETag mismatch (412). Retrying with fresh etag...");
-        continue;
-      }
-
-      console.error("updateContact failed:", out.status, out.json || out.text);
-      throw new Error("Failed to update contact");
+    if (out.ok) {
+      console.log("Updated Google contact:", out.json.resourceName);
+      return out.json;
     }
+
+    if (out.status === 412 && attempt === 1) {
+      console.warn("ETag mismatch (412). Retrying with fresh etag...");
+      continue;
+    }
+
+    console.error("updateContact failed:", out.status, out.json || out.text);
+    throw new Error("Failed to update contact");
   }
+}
 
   // ---------- CREATE ----------
   const r = await fetch("https://people.googleapis.com/v1/people:createContact", {
