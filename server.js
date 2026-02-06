@@ -201,48 +201,50 @@ async function upsertGoogleContact(prospect) {
 
   const found = await findExistingContact(prospect, accessToken);
 
-  // ---------- UPDATE ----------
-  if (found?.resourceName) {
-    const person = await getPerson(found.resourceName, accessToken);
-    const rn = ensurePeopleResourceName(person.resourceName);
+// ---------- UPDATE ----------
+if (found?.resourceName) {
+  const person = await getPerson(found.resourceName, accessToken);
+  const rn = ensurePeopleResourceName(person.resourceName);
 
-    const updateUrl =
-      `https://people.googleapis.com/v1/${rn}:updateContact` +
-      "?updatePersonFields=names,emailAddresses,phoneNumbers,biographies,organizations";
+  const updateUrl =
+    `https://people.googleapis.com/v1/${rn}:updateContact` +
+    "?updatePersonFields=names,emailAddresses,phoneNumbers,biographies,organizations";
 
-    console.log("Updating resourceName:", rn);
-    console.log("Update URL:", updateUrl);
+  console.log("Updating resourceName:", rn);
+  console.log("Update URL:", updateUrl);
 
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      const etag =
-        attempt === 1 ? person.etag : (await getPerson(rn, accessToken)).etag;
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    const etag =
+      attempt === 1 ? person.etag : (await getPerson(rn, accessToken)).etag;
 
-      const r = await fetch(updateUrl, {
-        method: "PATCH",
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          "Content-Type": "application/json",
-          ...(etag ? { "If-Match": etag } : {}),
-        },
-        body: JSON.stringify(body),
-      });
+    const r = await fetch(updateUrl, {
+      method: "PATCH",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        "Content-Type": "application/json",
+        // keep If-Match too (doesn't hurt), but the body etag is the key fix
+        ...(etag ? { "If-Match": etag } : {}),
+      },
+      // ✅ IMPORTANT: include etag in body
+      body: JSON.stringify({ ...body, etag }),
+    });
 
-      const out = await readJsonOrText(r);
+    const out = await readJsonOrText(r);
 
-      if (out.ok) {
-        console.log("Updated Google contact:", out.json.resourceName);
-        return out.json;
-      }
-
-      if (out.status === 412 && attempt === 1) {
-        console.warn("ETag mismatch (412). Retrying with fresh etag...");
-        continue;
-      }
-
-      console.error("updateContact failed:", out.status, out.json || out.text);
-      throw new Error("Failed to update contact");
+    if (out.ok) {
+      console.log("Updated Google contact:", out.json.resourceName);
+      return out.json;
     }
+
+    if (out.status === 412 && attempt === 1) {
+      console.warn("ETag mismatch (412). Retrying with fresh etag...");
+      continue;
+    }
+
+    console.error("updateContact failed:", out.status, out.json || out.text);
+    throw new Error("Failed to update contact");
   }
+}
 
   // ---------- CREATE ----------
   const r = await fetch("https://people.googleapis.com/v1/people:createContact", {
