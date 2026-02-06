@@ -16,8 +16,6 @@ function normalizeEmail(e) {
 }
 
 // Keep a consistent phone string to STORE (digits, optionally prefixed with +)
-// NOTE: Without knowing country, we can’t safely force true E.164.
-// We still store digits-only (or +digits if user provided +).
 function normalizePhoneForStore(p) {
   if (!p) return "";
   const raw = String(p).trim();
@@ -31,6 +29,12 @@ function last10Digits(d) {
   const s = String(d || "");
   if (s.length <= 10) return s;
   return s.slice(-10);
+}
+
+// Fix: this was missing in your current deploy
+function ensurePeopleResourceName(resourceName) {
+  if (!resourceName) return resourceName;
+  return resourceName.startsWith("people/") ? resourceName : `people/${resourceName}`;
 }
 
 async function readJsonOrText(r) {
@@ -71,7 +75,6 @@ async function getGoogleAccessToken() {
 // ------------------ PEOPLE API: SEARCH + GET ------------------
 
 async function searchGoogleContacts(query, accessToken) {
-  // searchContacts is fuzzy; we will VERIFY results by exact-ish matching after.
   const url =
     "https://people.googleapis.com/v1/people:searchContacts" +
     `?query=${encodeURIComponent(query)}` +
@@ -95,6 +98,7 @@ async function searchGoogleContacts(query, accessToken) {
 
 async function getPerson(resourceName, accessToken) {
   const rn = ensurePeopleResourceName(resourceName);
+
   const url =
     `https://people.googleapis.com/v1/${rn}` +
     "?personFields=names,emailAddresses,phoneNumbers,biographies,organizations";
@@ -132,7 +136,6 @@ function personHasPhone(person, phoneDigits) {
     const pd = digitsOnly(p?.value || "");
     if (!pd) continue;
 
-    // Match either full digits or last10 (covers formatting/country-code differences)
     if (pd === targetDigits) return true;
     if (last10Digits(pd) === targetLast10 && targetLast10.length === 10) return true;
   }
@@ -145,38 +148,26 @@ async function findExistingContact(prospect, accessToken) {
   const phoneDigits = digitsOnly(phoneStored);
   const phoneLast10 = last10Digits(phoneDigits);
 
-  // Build several search attempts (because searchContacts is fuzzy)
   const queries = [];
 
-  // Phone-first (your rule is phone required anyway)
   if (phoneDigits) {
-    queries.push(phoneStored);      // might include +digits
-    queries.push(phoneDigits);      // digits only
-    if (phoneLast10 && phoneLast10.length === 10) queries.push(phoneLast10); // common match
+    queries.push(phoneStored);
+    queries.push(phoneDigits);
+    if (phoneLast10 && phoneLast10.length === 10) queries.push(phoneLast10);
   }
 
-  // Also try email if present (helps if phone matching fails)
   if (email) queries.push(email);
 
-  // De-dup query list
   const uniqQueries = [...new Set(queries)].filter(Boolean);
 
   for (const q of uniqQueries) {
     const people = await searchGoogleContacts(q, accessToken);
     if (!people.length) continue;
 
-    // Prefer strongest verified match:
-    // 1) exact-ish phone match
-    // 2) exact email match
-    // 3) fallback: if only one result returned, use it
-    const byPhone = phoneDigits
-      ? people.find((p) => personHasPhone(p, phoneDigits))
-      : null;
+    const byPhone = phoneDigits ? people.find((p) => personHasPhone(p, phoneDigits)) : null;
     if (byPhone?.resourceName) return byPhone;
 
-    const byEmail = email
-      ? people.find((p) => personHasEmail(p, email))
-      : null;
+    const byEmail = email ? people.find((p) => personHasEmail(p, email)) : null;
     if (byEmail?.resourceName) return byEmail;
 
     if (people.length === 1 && people[0]?.resourceName) return people[0];
@@ -188,16 +179,13 @@ async function findExistingContact(prospect, accessToken) {
 // ------------------ UPSERT (NO DUPES) ------------------
 
 async function upsertGoogleContact(prospect) {
-  // Your rule: ONLY sync if phone exists
   const phoneStored = normalizePhoneForStore(prospect?.phone);
   const phoneDigits = digitsOnly(phoneStored);
   if (!phoneDigits) return;
 
   const email = normalizeEmail(prospect?.email);
-
   const accessToken = await getGoogleAccessToken();
 
-  // What we want to write to Google
   const body = {
     names: [
       {
@@ -207,68 +195,54 @@ async function upsertGoogleContact(prospect) {
     ],
     emailAddresses: email ? [{ value: email }] : [],
     phoneNumbers: [{ value: phoneStored || phoneDigits }],
-    biographies: [
-      {
-        value: `Source: Bonzo | ID: ${prospect?.id || ""}`,
-      },
-    ],
-    // Optional: helps you visually identify these contacts
-    organizations: [
-      {
-        name: "Home Loans",
-        title: "Lead",
-      },
-    ],
+    biographies: [{ value: `Source: Bonzo | ID: ${prospect?.id || ""}` }],
+    organizations: [{ name: "Home Loans", title: "Lead" }],
   };
 
-  // 1) Find existing with VERIFIED matching
   const found = await findExistingContact(prospect, accessToken);
 
-// ---------- UPDATE ----------
-if (found?.resourceName) {
-  const person = await getPerson(found.resourceName, accessToken);
+  // ---------- UPDATE ----------
+  if (found?.resourceName) {
+    const person = await getPerson(found.resourceName, accessToken);
+    const rn = ensurePeopleResourceName(person.resourceName);
 
-  // person.resourceName should already look like: "people/XXXXXXXX"
-  const rn = person.resourceName;
+    const updateUrl =
+      `https://people.googleapis.com/v1/${rn}:updateContact` +
+      "?updatePersonFields=names,emailAddresses,phoneNumbers,biographies,organizations";
 
-console.log("Updating resourceName:", rn);
-console.log("Update URL:", updateUrl);
-  
-  const updateUrl =
-    `https://people.googleapis.com/v1/${rn}:updateContact` +
-    "?updatePersonFields=names,emailAddresses,phoneNumbers,biographies,organizations";
+    console.log("Updating resourceName:", rn);
+    console.log("Update URL:", updateUrl);
 
-  // Try once; if we get 412 (etag mismatch), refetch etag and retry once
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    const etag =
-      attempt === 1 ? person.etag : (await getPerson(rn, accessToken)).etag;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const etag =
+        attempt === 1 ? person.etag : (await getPerson(rn, accessToken)).etag;
 
-    const r = await fetch(updateUrl, {
-      method: "PATCH",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-        ...(etag ? { "If-Match": etag } : {}),
-      },
-      body: JSON.stringify(body),
-    });
+      const r = await fetch(updateUrl, {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+          ...(etag ? { "If-Match": etag } : {}),
+        },
+        body: JSON.stringify(body),
+      });
 
-    const out = await readJsonOrText(r);
+      const out = await readJsonOrText(r);
 
-    if (out.ok) {
-      console.log("Updated Google contact:", out.json.resourceName);
-      return out.json;
+      if (out.ok) {
+        console.log("Updated Google contact:", out.json.resourceName);
+        return out.json;
+      }
+
+      if (out.status === 412 && attempt === 1) {
+        console.warn("ETag mismatch (412). Retrying with fresh etag...");
+        continue;
+      }
+
+      console.error("updateContact failed:", out.status, out.json || out.text);
+      throw new Error("Failed to update contact");
     }
-
-    if (out.status === 412 && attempt === 1) {
-      console.warn("ETag mismatch (412). Retrying with fresh etag...");
-      continue;
-    }
-
-    console.error("updateContact failed:", out.status, out.json || out.text);
-    throw new Error("Failed to update contact");
   }
-}
 
   // ---------- CREATE ----------
   const r = await fetch("https://people.googleapis.com/v1/people:createContact", {
@@ -303,7 +277,6 @@ app.post("/bonzo/events", async (req, res) => {
     const { event, prospect } = req.body;
     console.log("Bonzo event:", event);
 
-    // Keep your triggers
     if (["prospects.created", "prospects.updated"].includes(event)) {
       await upsertGoogleContact(prospect);
     }
