@@ -6,26 +6,31 @@ app.use(express.json({ limit: "1mb" }));
 
 // ------------------ HELPERS ------------------
 
-function normalizePhone(p) {
-  if (!p) return "";
-  let s = String(p).trim();
-
-  // keep leading + if present, strip everything else to digits
-  const hasPlus = s.startsWith("+");
-  s = s.replace(/[^\d]/g, "");
-
-  return hasPlus ? `+${s}` : s;
+function digitsOnly(p) {
+  return String(p || "").replace(/\D/g, "");
 }
 
-// Phone first, then email
-function bestQueryKey(prospect) {
-  const phone = normalizePhone(prospect?.phone);
-  if (phone) return { type: "phone", value: phone };
+function normalizeEmail(e) {
+  const s = String(e || "").trim().toLowerCase();
+  return s || "";
+}
 
-  const email = (prospect?.email || "").trim().toLowerCase();
-  if (email) return { type: "email", value: email };
+// Keep a consistent phone string to STORE (digits, optionally prefixed with +)
+// NOTE: Without knowing country, we can’t safely force true E.164.
+// We still store digits-only (or +digits if user provided +).
+function normalizePhoneForStore(p) {
+  if (!p) return "";
+  const raw = String(p).trim();
+  const hasPlus = raw.startsWith("+");
+  const d = digitsOnly(raw);
+  if (!d) return "";
+  return hasPlus ? `+${d}` : d;
+}
 
-  return null;
+function last10Digits(d) {
+  const s = String(d || "");
+  if (s.length <= 10) return s;
+  return s.slice(-10);
 }
 
 function ensurePeopleResourceName(resourceName) {
@@ -68,13 +73,14 @@ async function getGoogleAccessToken() {
   return out.json.access_token;
 }
 
-// ------------------ SEARCH CONTACT ------------------
+// ------------------ PEOPLE API: SEARCH + GET ------------------
 
-async function searchGoogleContact(query, accessToken) {
+async function searchGoogleContacts(query, accessToken) {
+  // searchContacts is fuzzy; we will VERIFY results by exact-ish matching after.
   const url =
     "https://people.googleapis.com/v1/people:searchContacts" +
     `?query=${encodeURIComponent(query)}` +
-    "&readMask=names,emailAddresses,phoneNumbers,biographies" +
+    "&readMask=names,emailAddresses,phoneNumbers,biographies,resourceName" +
     "&pageSize=10";
 
   const r = await fetch(url, {
@@ -88,21 +94,115 @@ async function searchGoogleContact(query, accessToken) {
     throw new Error("Failed to search contacts");
   }
 
-  return out.json?.results?.[0]?.person || null;
+  const results = out.json?.results || [];
+  return results.map((x) => x.person).filter(Boolean);
+}
+
+async function getPerson(resourceName, accessToken) {
+  const rn = ensurePeopleResourceName(resourceName);
+  const url =
+    `https://people.googleapis.com/v1/${rn}` +
+    "?personFields=names,emailAddresses,phoneNumbers,biographies,organizations";
+
+  const r = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+
+  const out = await readJsonOrText(r);
+
+  if (!out.ok) {
+    console.error("getPerson failed:", out.status, out.json || out.text);
+    throw new Error("Failed to read person");
+  }
+
+  return out.json;
+}
+
+// ------------------ MATCHING LOGIC (PREVENT DUPES) ------------------
+
+function personHasEmail(person, email) {
+  if (!email) return false;
+  const emails = person?.emailAddresses || [];
+  return emails.some((e) => normalizeEmail(e?.value) === email);
+}
+
+function personHasPhone(person, phoneDigits) {
+  if (!phoneDigits) return false;
+
+  const targetDigits = digitsOnly(phoneDigits);
+  const targetLast10 = last10Digits(targetDigits);
+
+  const phones = person?.phoneNumbers || [];
+  for (const p of phones) {
+    const pd = digitsOnly(p?.value || "");
+    if (!pd) continue;
+
+    // Match either full digits or last10 (covers formatting/country-code differences)
+    if (pd === targetDigits) return true;
+    if (last10Digits(pd) === targetLast10 && targetLast10.length === 10) return true;
+  }
+  return false;
+}
+
+async function findExistingContact(prospect, accessToken) {
+  const email = normalizeEmail(prospect?.email);
+  const phoneStored = normalizePhoneForStore(prospect?.phone);
+  const phoneDigits = digitsOnly(phoneStored);
+  const phoneLast10 = last10Digits(phoneDigits);
+
+  // Build several search attempts (because searchContacts is fuzzy)
+  const queries = [];
+
+  // Phone-first (your rule is phone required anyway)
+  if (phoneDigits) {
+    queries.push(phoneStored);      // might include +digits
+    queries.push(phoneDigits);      // digits only
+    if (phoneLast10 && phoneLast10.length === 10) queries.push(phoneLast10); // common match
+  }
+
+  // Also try email if present (helps if phone matching fails)
+  if (email) queries.push(email);
+
+  // De-dup query list
+  const uniqQueries = [...new Set(queries)].filter(Boolean);
+
+  for (const q of uniqQueries) {
+    const people = await searchGoogleContacts(q, accessToken);
+    if (!people.length) continue;
+
+    // Prefer strongest verified match:
+    // 1) exact-ish phone match
+    // 2) exact email match
+    // 3) fallback: if only one result returned, use it
+    const byPhone = phoneDigits
+      ? people.find((p) => personHasPhone(p, phoneDigits))
+      : null;
+    if (byPhone?.resourceName) return byPhone;
+
+    const byEmail = email
+      ? people.find((p) => personHasEmail(p, email))
+      : null;
+    if (byEmail?.resourceName) return byEmail;
+
+    if (people.length === 1 && people[0]?.resourceName) return people[0];
+  }
+
+  return null;
 }
 
 // ------------------ UPSERT (NO DUPES) ------------------
 
 async function upsertGoogleContact(prospect) {
   // Your rule: ONLY sync if phone exists
-  const phone = normalizePhone(prospect?.phone);
-  if (!phone) return;
+  const phoneStored = normalizePhoneForStore(prospect?.phone);
+  const phoneDigits = digitsOnly(phoneStored);
+  if (!phoneDigits) return;
 
-  const key = bestQueryKey(prospect);
-  if (!key) return;
+  const email = normalizeEmail(prospect?.email);
 
   const accessToken = await getGoogleAccessToken();
 
+  // What we want to write to Google
   const body = {
     names: [
       {
@@ -110,46 +210,65 @@ async function upsertGoogleContact(prospect) {
         familyName: prospect?.last_name || "",
       },
     ],
-    emailAddresses: prospect?.email
-      ? [{ value: prospect.email.trim().toLowerCase() }]
-      : [],
-    phoneNumbers: [{ value: phone }],
+    emailAddresses: email ? [{ value: email }] : [],
+    phoneNumbers: [{ value: phoneStored || phoneDigits }],
     biographies: [
       {
         value: `Source: Bonzo | ID: ${prospect?.id || ""}`,
       },
     ],
+    // Optional: helps you visually identify these contacts
+    organizations: [
+      {
+        name: "Home Loans",
+        title: "Lead",
+      },
+    ],
   };
 
-  const existing = await searchGoogleContact(key.value, accessToken);
+  // 1) Find existing with VERIFIED matching
+  const found = await findExistingContact(prospect, accessToken);
 
   // ---------- UPDATE ----------
-  if (existing?.resourceName && existing?.etag) {
-    const rn = ensurePeopleResourceName(existing.resourceName);
+  if (found?.resourceName) {
+    // 2) GET person to obtain fresh etag (PATCH If-Match is safer with a real etag)
+    const full = await getPerson(found.resourceName, accessToken);
+    const rn = ensurePeopleResourceName(full.resourceName);
 
     const updateUrl =
       `https://people.googleapis.com/v1/${rn}` +
-      "?updatePersonFields=names,emailAddresses,phoneNumbers,biographies";
+      "?updatePersonFields=names,emailAddresses,phoneNumbers,biographies,organizations";
 
-    const r = await fetch(updateUrl, {
-      method: "PATCH",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-        "If-Match": existing.etag,
-      },
-      body: JSON.stringify(body),
-    });
+    // Try once; if we get 412 (etag mismatch), refetch etag and retry once
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const etag = attempt === 1 ? full.etag : (await getPerson(rn, accessToken)).etag;
 
-    const out = await readJsonOrText(r);
+      const r = await fetch(updateUrl, {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+          ...(etag ? { "If-Match": etag } : {}),
+        },
+        body: JSON.stringify(body),
+      });
 
-    if (!out.ok) {
+      const out = await readJsonOrText(r);
+
+      if (out.ok) {
+        console.log("Updated Google contact:", out.json.resourceName);
+        return out.json;
+      }
+
+      // If etag conflict, retry once
+      if (out.status === 412 && attempt === 1) {
+        console.warn("ETag mismatch (412). Retrying with fresh etag...");
+        continue;
+      }
+
       console.error("updateContact failed:", out.status, out.json || out.text);
       throw new Error("Failed to update contact");
     }
-
-    console.log("Updated Google contact:", out.json.resourceName);
-    return out.json;
   }
 
   // ---------- CREATE ----------
@@ -185,6 +304,7 @@ app.post("/bonzo/events", async (req, res) => {
     const { event, prospect } = req.body;
     console.log("Bonzo event:", event);
 
+    // Keep your triggers
     if (["prospects.created", "prospects.updated"].includes(event)) {
       await upsertGoogleContact(prospect);
     }
