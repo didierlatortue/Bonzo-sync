@@ -230,9 +230,6 @@ async function upsertGoogleContact(prospect) {
     organizations: [{ name: "Home Loans", title: "Lead" }],
   };
 
-  // ... keep the rest of your update/create logic exactly as-is below ...
-}
-
   const found = await findExistingContact(prospect, accessToken);
 
 // ---------- UPDATE ----------
