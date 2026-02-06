@@ -236,7 +236,7 @@ async function upsertGoogleContact(prospect) {
     const rn = ensurePeopleResourceName(full.resourceName);
 
     const updateUrl =
-      `https://people.googleapis.com/v1/${rn}` +
+      `https://people.googleapis.com/v1/${rn}:updateConact` +
       "?updatePersonFields=names,emailAddresses,phoneNumbers,biographies,organizations";
 
     // Try once; if we get 412 (etag mismatch), refetch etag and retry once
