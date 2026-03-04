@@ -1,3 +1,4 @@
+
 import express from "express";
 import fetch from "node-fetch";
 
@@ -30,7 +31,6 @@ function last10Digits(d) {
   if (s.length <= 10) return s;
   return s.slice(-10);
 }
-
 // Fix: this was missing in your current deploy
 function ensurePeopleResourceName(resourceName) {
   if (!resourceName) return resourceName;
@@ -321,6 +321,12 @@ app.post("/bonzo/events", async (req, res) => {
   }
 });
 
+// ------------------- Clean up Webook ---------------
+
+app.post("/bonzo/event-hook", (req, res) => {
+  console.log("BONZO EVENT:", JSON.stringify(req.body, null, 2));
+  res.sendStatus(200);
+});
 // ------------------ START SERVER ------------------
 
 app.listen(process.env.PORT || 3000, () => {
