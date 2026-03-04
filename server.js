@@ -7,9 +7,9 @@ app.use(express.json({ limit: "1mb" }));
 /**
  * ENV REQUIRED:
  *  - BONZO_CODE
- *  - BONZO_API_KEY           (Bonzo Personal API access token)
- *  - (optional) BONZO_BASE_URL default https://platform.getbonzo.com/api
- *  - SCAN_SECRET             (to protect /scan-bounces)
+ *  - BONZO_API_KEY
+ *  - BONZO_AUTH_MODE  (bearer | raw | xapikey)  <-- IMPORTANT
+ *  - (optional) BONZO_BASE_URL default https://app.getbonzo.com/api
  *
  *  - GOOGLE_CLIENT_ID
  *  - GOOGLE_CLIENT_SECRET
@@ -19,6 +19,8 @@ app.use(express.json({ limit: "1mb" }));
  *  - MS_CLIENT_ID
  *  - MS_CLIENT_SECRET
  *  - OUTLOOK_MAILBOX   (example: didier@turturhomeloans.com)
+ *
+ *  - SCAN_SECRET  (required for /scan-bounces)
  */
 
 // ------------------ HELPERS ------------------
@@ -32,7 +34,6 @@ function normalizeEmail(e) {
   return s || "";
 }
 
-// Keep a consistent phone string to STORE (digits, optionally prefixed with +)
 function normalizePhoneForStore(p) {
   if (!p) return "";
   const raw = String(p).trim();
@@ -62,7 +63,6 @@ async function readJsonOrText(r) {
   }
 }
 
-// robocaller helper
 function nameLooksLikePhone(first, last) {
   const full = `${first || ""} ${last || ""}`.trim();
   if (!full) return true;
@@ -137,7 +137,7 @@ async function getPerson(resourceName, accessToken) {
   return out.json;
 }
 
-// ------------------ MATCHING LOGIC (PREVENT DUPES) ------------------
+// ------------------ MATCHING LOGIC ------------------
 
 function personHasEmail(person, email) {
   if (!email) return false;
@@ -196,7 +196,7 @@ async function findExistingContact(prospect, accessToken) {
   return null;
 }
 
-// ------------------ UPSERT (NO DUPES) ------------------
+// ------------------ UPSERT GOOGLE CONTACT ------------------
 
 async function upsertGoogleContact(prospect) {
   if (nameLooksLikePhone(prospect?.first_name, prospect?.last_name)) {
@@ -226,7 +226,7 @@ async function upsertGoogleContact(prospect) {
 
   const found = await findExistingContact(prospect, accessToken);
 
-  // ---------- UPDATE ----------
+  // UPDATE
   if (found?.resourceName) {
     const person = await getPerson(found.resourceName, accessToken);
     const rn = ensurePeopleResourceName(person.resourceName);
@@ -234,9 +234,6 @@ async function upsertGoogleContact(prospect) {
     const updateUrl =
       `https://people.googleapis.com/v1/${rn}:updateContact` +
       "?updatePersonFields=names,emailAddresses,phoneNumbers,biographies,organizations";
-
-    console.log("Updating resourceName:", rn);
-    console.log("Update URL:", updateUrl);
 
     for (let attempt = 1; attempt <= 2; attempt++) {
       const etag = attempt === 1 ? person.etag : (await getPerson(rn, accessToken)).etag;
@@ -258,17 +255,14 @@ async function upsertGoogleContact(prospect) {
         return out.json;
       }
 
-      if (out.status === 412 && attempt === 1) {
-        console.warn("ETag mismatch (412). Retrying with fresh etag...");
-        continue;
-      }
+      if (out.status === 412 && attempt === 1) continue;
 
       console.error("updateContact failed:", out.status, out.json || out.text);
       throw new Error("Failed to update contact");
     }
   }
 
-  // ---------- CREATE ----------
+  // CREATE
   const r = await fetch("https://people.googleapis.com/v1/people:createContact", {
     method: "POST",
     headers: {
@@ -291,132 +285,73 @@ async function upsertGoogleContact(prospect) {
 
 // ------------------ BONZO API HELPERS ------------------
 
-function bonzoBaseCandidates() {
-  // Prefer env override first
-  const env = (process.env.BONZO_BASE_URL || "").trim();
-  const bases = [];
-
-  if (env) bases.push(env.replace(/\/$/, ""));
-
-  // Fallbacks (your logs show platform; your webhooks show app)
-  bases.push("https://app.getbonzo.com/api");
-  bases.push("https://platform.getbonzo.com/api");
-
-  // de-dupe
-  return [...new Set(bases)];
+function bonzoBase() {
+  // IMPORTANT: default to app.getbonzo.com (matches your webhook URLs)
+  return process.env.BONZO_BASE_URL || "https://app.getbonzo.com/api";
 }
 
-function bonzoTokenRaw() {
-  const t = String(process.env.BONZO_API_KEY || "").trim();
-  // If you accidentally saved "Bearer xxx" in Render, normalize it:
-  return t.toLowerCase().startsWith("bearer ") ? t.slice(7).trim() : t;
+function bonzoHeaders() {
+  const mode = String(process.env.BONZO_AUTH_MODE || "raw").toLowerCase();
+  const key = process.env.BONZO_API_KEY || "";
+
+  // Always ask for JSON so we don't get HTML back
+  const base = {
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  };
+
+  // Modes:
+  //  - bearer: Authorization: Bearer <token>
+  //  - raw:    Authorization: <token>   (NO "Bearer")
+  //  - xapikey: X-API-KEY: <token>
+  if (mode === "bearer") return { ...base, Authorization: `Bearer ${key}` };
+  if (mode === "xapikey") return { ...base, "X-API-KEY": key };
+  return { ...base, Authorization: key }; // raw (your “no Bearer” case)
 }
 
-function authHeaderVariants() {
-  const token = bonzoTokenRaw();
-  if (!token) return [];
-
-  // Try a few common patterns. One of these will usually work.
-  return [
-    { "X-API-KEY": token },
-    { Authorization: `Bearer ${token}` },
-    { "X-Access-Token": token },
-    { "X-Auth-Token": token },
-  ];
-}
-
-async function bonzoFetchAny(path, { method = "GET", body } = {}) {
-  const bases = bonzoBaseCandidates();
-  const authVariants = authHeaderVariants();
-
-  if (!authVariants.length) {
-    throw new Error("Missing BONZO_API_KEY env var");
-  }
-
-  let lastOut = null;
-
-  for (const base of bases) {
-    const url = `${base}${path}`;
-
-    for (const authHeaders of authVariants) {
-      const headers = { ...authHeaders, "Content-Type": "application/json" };
-
-      const r = await fetch(url, {
-        method,
-        headers,
-        ...(body ? { body: JSON.stringify(body) } : {}),
-      });
-
-      const out = await readJsonOrText(r);
-      lastOut = out;
-
-      // Useful logging to see what finally works
-      if (out.status === 401 || out.status === 403) {
-        console.log("Bonzo auth rejected:", { url, method, status: out.status, headersTried: Object.keys(authHeaders) });
-        continue;
-      }
-
-      if (out.status === 404) {
-        console.log("Bonzo route not found:", { url, method, status: out.status });
-        continue;
-      }
-
-      // Anything else (200/201/204, or other errors) — return it so we can see the response
-      if (!out.ok) {
-        console.log("Bonzo request error:", { url, method, status: out.status, body: out.json || out.text });
-      } else {
-        console.log("Bonzo request OK:", { url, method, status: out.status, headersUsed: Object.keys(authHeaders) });
-      }
-
-      return out;
-    }
-  }
-
-  return lastOut || { ok: false, status: 0, json: null, text: "No response" };
+async function bonzoFetch(path, opts = {}) {
+  const url = `${bonzoBase()}${path}`;
+  const r = await fetch(url, {
+    ...opts,
+    headers: {
+      ...bonzoHeaders(),
+      ...(opts.headers || {}),
+    },
+  });
+  return await readJsonOrText(r);
 }
 
 async function bonzoGetProspectById(id) {
-  return await bonzoFetchAny(`/prospects/${id}`, { method: "GET" });
+  return await bonzoFetch(`/prospects/${id}`, { method: "GET" });
 }
 
 async function bonzoPutProspectFull(id, prospectObj) {
-  return await bonzoFetchAny(`/prospects/${id}`, { method: "PUT", body: prospectObj });
+  return await bonzoFetch(`/prospects/${id}`, {
+    method: "PUT",
+    body: JSON.stringify(prospectObj),
+  });
 }
 
-/**
- * Find prospect(s) by email.
- * We try several endpoint shapes because some of the old guesses 404 in your logs.
- */
+// Best-effort search (leave this; it will start working once auth mode is right)
 async function bonzoFindProspectsByEmail(email) {
   const e = normalizeEmail(email);
   if (!e) return [];
 
-  const candidatePaths = [
-    // Most common patterns
-    `/prospects?email=${encodeURIComponent(e)}`,
+  const candidates = [
     `/prospects?query=${encodeURIComponent(e)}`,
     `/prospects?search=${encodeURIComponent(e)}`,
-    // Sometimes "filter" is used
-    `/prospects?filter=${encodeURIComponent(e)}`,
-    // Sometimes it's a dedicated endpoint
-    `/prospects/search?email=${encodeURIComponent(e)}`,
     `/prospects/search?query=${encodeURIComponent(e)}`,
   ];
 
-  for (const path of candidatePaths) {
-    const out = await bonzoFetchAny(path, { method: "GET" });
+  for (const path of candidates) {
+    const out = await bonzoFetch(path, { method: "GET" });
 
-    // If the route doesn't exist, try the next one
-    if (out?.status === 404) continue;
-
-    if (!out?.ok) {
-      // If auth fails here, no other paths will work until auth is fixed,
-      // but we keep going to collect logs.
+    if (!out.ok) {
+      console.log("Bonzo search failed:", path, out.status, out.json || out.text);
       continue;
     }
 
     const data = out.json;
-
     const list =
       data?.prospects ||
       data?.data ||
@@ -475,7 +410,8 @@ async function graphGet(path, token) {
   return out.json;
 }
 
-// Extract an email address from bounce-like content
+// ------------------ BOUNCE DETECTION ------------------
+
 function extractEmailFromText(text) {
   const t = String(text || "");
   const m = t.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi);
@@ -499,6 +435,24 @@ function isBounceSubject(subject) {
   );
 }
 
+// In-memory de-dupe for scanned messages (prevents repeat deletes)
+const seenMessageIds = new Map(); // id -> timestamp
+function markSeen(id) {
+  if (!id) return;
+  seenMessageIds.set(id, Date.now());
+}
+function isSeen(id) {
+  if (!id) return false;
+  return seenMessageIds.has(id);
+}
+// Clean old entries every 10 minutes (keep ~1 hour)
+setInterval(() => {
+  const cutoff = Date.now() - 60 * 60 * 1000;
+  for (const [id, ts] of seenMessageIds.entries()) {
+    if (ts < cutoff) seenMessageIds.delete(id);
+  }
+}, 10 * 60 * 1000);
+
 // ------------------ WEBHOOKS ------------------
 
 app.post("/bonzo/events", async (req, res) => {
@@ -520,7 +474,7 @@ app.post("/bonzo/events", async (req, res) => {
   }
 });
 
-// Cleanup webhook: bad phone / bad email
+// Cleanup webhook: bad phone / bad email (Bonzo event hook)
 app.post("/bonzo/event-hook", async (req, res) => {
   try {
     const code = req.header("x-bonzo-code");
@@ -537,20 +491,18 @@ app.post("/bonzo/event-hook", async (req, res) => {
 
     const status = String(message.status || "").toLowerCase();
     const type = String(message.type || "").toLowerCase();
-
     const prospectId = message?.prospect?.id || prospect?.id || message?.prospect_id;
 
     console.log("Message update:", { status, type, prospectId, messageId: message.id });
 
     const BAD_STATUSES = new Set(["failed", "bounced", "undeliverable", "error"]);
-
     if (!prospectId) return res.status(200).json({ ok: true, skipped: true, reason: "no_prospect_id" });
     if (!BAD_STATUSES.has(status)) return res.status(200).json({ ok: true, skipped: true, reason: "status_not_bad" });
     if (type !== "sms" && type !== "email") return res.status(200).json({ ok: true, skipped: true, reason: "type_not_sms_or_email" });
 
-    // GET current prospect (Bonzo requires PUT)
     const getOut = await bonzoGetProspectById(prospectId);
 
+    // If you ever see HTML here, auth/base URL is wrong
     if (!getOut.ok || !getOut.json) {
       console.log("Cleanup skipped: could not GET prospect", getOut.status, getOut.json || getOut.text);
       return res.status(200).json({ ok: true, skipped: true, reason: "get_failed" });
@@ -561,7 +513,7 @@ app.post("/bonzo/event-hook", async (req, res) => {
     if (type === "sms") {
       current.phone = null;
       current.tags = Array.from(new Set([...(current.tags || []), "bad_phone"]));
-    } else if (type === "email") {
+    } else {
       current.email = null;
       current.tags = Array.from(new Set([...(current.tags || []), "bad_email"]));
     }
@@ -578,10 +530,6 @@ app.post("/bonzo/event-hook", async (req, res) => {
 
 // ------------------ OUTLOOK TEST + BOUNCE SCAN ------------------
 
-/**
- * Test route: confirms Graph token works + mailbox is readable
- * Visit: https://bonzo-sync.onrender.com/test-outlook
- */
 app.get("/test-outlook", async (req, res) => {
   try {
     const mailbox = process.env.OUTLOOK_MAILBOX;
@@ -589,13 +537,13 @@ app.get("/test-outlook", async (req, res) => {
 
     const token = await getMsGraphToken();
 
-    // list top 5 inbox messages
     const data = await graphGet(
-      `/users/${encodeURIComponent(mailbox)}/mailFolders/Inbox/messages?$top=5&$select=subject,receivedDateTime,from,bodyPreview`,
+      `/users/${encodeURIComponent(mailbox)}/mailFolders/Inbox/messages?$top=5&$select=id,subject,receivedDateTime,from,bodyPreview`,
       token
     );
 
     const messages = (data?.value || []).map((m) => ({
+      id: m.id,
       subject: m.subject,
       receivedDateTime: m.receivedDateTime,
       from: m.from?.emailAddress?.address || "",
@@ -609,19 +557,10 @@ app.get("/test-outlook", async (req, res) => {
   }
 });
 
-/**
- * Bounce scan:
- *   POST https://bonzo-sync.onrender.com/scan-bounces
- * Headers:
- *   x-scan-secret: <SCAN_SECRET>
- * Body (optional):
- *   { "top": 25 }
- */
 app.post("/scan-bounces", async (req, res) => {
   const secret = req.header("x-scan-secret");
-  if (secret !== process.env.SCAN_SECRET) {
-    return res.status(401).send("Unauthorized");
-  }
+  if (!process.env.SCAN_SECRET) return res.status(500).send("Missing SCAN_SECRET on server");
+  if (secret !== process.env.SCAN_SECRET) return res.status(401).send("Unauthorized");
 
   try {
     const mailbox = process.env.OUTLOOK_MAILBOX;
@@ -631,7 +570,7 @@ app.post("/scan-bounces", async (req, res) => {
     const token = await getMsGraphToken();
 
     const data = await graphGet(
-      `/users/${encodeURIComponent(mailbox)}/mailFolders/Inbox/messages?$top=${top}&$select=subject,receivedDateTime,from,bodyPreview`,
+      `/users/${encodeURIComponent(mailbox)}/mailFolders/Inbox/messages?$top=${top}&$select=id,subject,receivedDateTime,from,bodyPreview`,
       token
     );
 
@@ -639,30 +578,22 @@ app.post("/scan-bounces", async (req, res) => {
     const bounces = [];
 
     for (const m of items) {
+      if (isSeen(m.id)) continue;
+      markSeen(m.id);
+
       if (!isBounceSubject(m.subject)) continue;
 
       const email = extractEmailFromText(m.bodyPreview) || extractEmailFromText(m.subject);
 
       if (!email) {
-        bounces.push({
-          subject: m.subject,
-          receivedDateTime: m.receivedDateTime,
-          extractedEmail: "",
-          action: "no_email_found",
-        });
+        bounces.push({ id: m.id, subject: m.subject, extractedEmail: "", action: "no_email_found" });
         continue;
       }
 
-      // Find matching prospects in Bonzo, tag + clear email
       const prospects = await bonzoFindProspectsByEmail(email);
 
       if (!prospects.length) {
-        bounces.push({
-          subject: m.subject,
-          receivedDateTime: m.receivedDateTime,
-          extractedEmail: email,
-          action: "no_bonzo_match_found",
-        });
+        bounces.push({ id: m.id, subject: m.subject, extractedEmail: email, action: "no_bonzo_match_found" });
         continue;
       }
 
@@ -683,8 +614,8 @@ app.post("/scan-bounces", async (req, res) => {
       }
 
       bounces.push({
+        id: m.id,
         subject: m.subject,
-        receivedDateTime: m.receivedDateTime,
         extractedEmail: email,
         action: "clean_attempted",
         bonzoMatches: prospects.length,
