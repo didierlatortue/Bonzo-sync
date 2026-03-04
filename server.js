@@ -321,64 +321,111 @@ app.post("/bonzo/events", async (req, res) => {
   }
 });
 
-// ------------------- updated Clean up Webook in full  ---------------
+// ------------------- PUTs updated Clean up Webook in full  ---------------
 
 app.post("/bonzo/event-hook", async (req, res) => {
   try {
-    const { event, additional, prospect } = req.body;
-
-    // Only process outgoing message updates
-    if (event !== "messages.outgoing.updated") return res.sendStatus(200);
-
-    const message = additional?.message;
-    if (!message) return res.sendStatus(200);
-
-    const status = (message.status || "").toLowerCase();   // "sent", "error", etc.
-    const type = (message.type || "").toLowerCase();       // "sms" or "email"
-
-    // IMPORTANT: get the real prospect id (not message.id)
-    const prospectId =
-      message.prospect_id ||
-      message.prospect?.id ||
-      prospect?.id;
-
-    console.log("Message update:", status, type, "prospectId:", prospectId, "messageId:", message.id);
-
-    // Treat "error" as a failure too
-    const BAD_STATUSES = new Set(["failed", "bounced", "undeliverable", "error"]);
-
-    if (!prospectId) return res.sendStatus(200);
-
-    if (BAD_STATUSES.has(status)) {
-      const update = {};
-
-      if (type === "sms") {
-        update.phone = null;
-        update.tags = ["bad_phone"];
-      } else if (type === "email") {
-        update.email = null;
-        update.tags = ["bad_email"];
-      } else {
-        return res.sendStatus(200);
-      }
-
-      const r = await fetch(`https://platform.getbonzo.com/api/prospects/${prospectId}`, {
-        method: "PATCH",
-        headers: {
-          Authorization: `Bearer ${process.env.BONZO_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(update),
-      });
-
-      const body = await r.text();
-      console.log("Cleanup result:", r.status, body?.slice(0, 250));
+    // 1) Verify this request is from Bonzo (same style as your /bonzo/events route)
+    const code = req.header("x-bonzo-code");
+    if (code !== process.env.BONZO_CODE) {
+      return res.status(401).send("Unauthorized");
     }
 
-    return res.sendStatus(200);
+    const { event, additional, prospect } = req.body;
+
+    // Only process outgoing message status updates
+    if (event !== "messages.outgoing.updated") {
+      return res.status(200).json({ ok: true, ignored: true });
+    }
+
+    const message = additional?.message;
+    if (!message) {
+      return res.status(200).json({ ok: true, ignored: true, reason: "no_message" });
+    }
+
+    const status = String(message.status || "").toLowerCase(); // "sent", "error", etc.
+    const type = String(message.type || "").toLowerCase();     // "sms" or "email"
+
+    // IMPORTANT: pick the real prospect id (NOT the message id)
+    const prospectId =
+      message?.prospect?.id ||      // safest (nested object)
+      prospect?.id ||               // sometimes top-level prospect is included
+      message?.prospect_id;         // fallback (sometimes this is not the real prospect id)
+
+    console.log("Message update:", { status, type, prospectId, messageId: message.id });
+
+    // Treat "error" as a failure too (your logs show status = error for bad phone numbers)
+    const BAD_STATUSES = new Set(["failed", "bounced", "undeliverable", "error"]);
+
+    if (!prospectId) {
+      console.log("Cleanup skipped: prospectId missing");
+      return res.status(200).json({ ok: true, skipped: true, reason: "no_prospect_id" });
+    }
+
+    // Only clean on failure statuses
+    if (!BAD_STATUSES.has(status)) {
+      return res.status(200).json({ ok: true, skipped: true, reason: "status_not_bad" });
+    }
+
+    // Only clean sms/email
+    if (type !== "sms" && type !== "email") {
+      return res.status(200).json({ ok: true, skipped: true, reason: "type_not_sms_or_email" });
+    }
+
+    const baseUrl = process.env.BONZO_BASE_URL || "https://platform.getbonzo.com/api";
+
+    // 2) GET the current prospect (needed because Bonzo supports PUT, not PATCH,
+    // and PUT may require the full object)
+    const getRes = await fetch(`${baseUrl}/prospects/${prospectId}`, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${process.env.BONZO_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+    });
+
+    const currentText = await getRes.text();
+    let current;
+    try {
+      current = JSON.parse(currentText);
+    } catch {
+      current = null;
+    }
+
+    if (!getRes.ok || !current) {
+      console.log("Cleanup skipped: could not GET prospect", getRes.status, currentText?.slice(0, 300));
+      return res.status(200).json({ ok: true, skipped: true, reason: "get_failed" });
+    }
+
+    // 3) Modify fields
+    if (type === "sms") {
+      current.phone = null;
+      current.tags = Array.from(new Set([...(current.tags || []), "bad_phone"]));
+    } else if (type === "email") {
+      current.email = null;
+      current.tags = Array.from(new Set([...(current.tags || []), "bad_email"]));
+    }
+
+    // 4) PUT the updated prospect back (Bonzo supports PUT)
+    const putRes = await fetch(`${baseUrl}/prospects/${prospectId}`, {
+      method: "PUT",
+      headers: {
+        Authorization: `Bearer ${process.env.BONZO_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(current),
+    });
+
+    const putBody = await putRes.text();
+    console.log("Cleanup result:", putRes.status, putBody?.slice(0, 300));
+
+    // Return 200 so Bonzo doesn't keep retrying
+    return res.status(200).json({ ok: true, cleaned: putRes.ok, status: putRes.status });
+
   } catch (err) {
     console.error("Cleanup error:", err);
-    return res.sendStatus(500);
+    // Still return 200 so Bonzo won't retry forever while you're testing
+    return res.status(200).json({ ok: false, error: "exception" });
   }
 });
 
