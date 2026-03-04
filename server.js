@@ -321,57 +321,64 @@ app.post("/bonzo/events", async (req, res) => {
   }
 });
 
-// ------------------- Clean up Webook in full  ---------------
+// ------------------- updated Clean up Webook in full  ---------------
 
 app.post("/bonzo/event-hook", async (req, res) => {
   try {
+    const { event, additional, prospect } = req.body;
 
-    const { event, additional } = req.body;
-
-    if (event !== "messages.outgoing.updated") {
-      return res.sendStatus(200);
-    }
+    // Only process outgoing message updates
+    if (event !== "messages.outgoing.updated") return res.sendStatus(200);
 
     const message = additional?.message;
     if (!message) return res.sendStatus(200);
 
-    const status = message.status;
-    const type = message.type;
-    const prospectId = message.prospect_id;
+    const status = (message.status || "").toLowerCase();   // "sent", "error", etc.
+    const type = (message.type || "").toLowerCase();       // "sms" or "email"
 
-    console.log("Message update:", status, type, prospectId);
+    // IMPORTANT: get the real prospect id (not message.id)
+    const prospectId =
+      message.prospect_id ||
+      message.prospect?.id ||
+      prospect?.id;
 
-    if (["failed", "bounced", "undeliverable"].includes(status)) {
+    console.log("Message update:", status, type, "prospectId:", prospectId, "messageId:", message.id);
 
+    // Treat "error" as a failure too
+    const BAD_STATUSES = new Set(["failed", "bounced", "undeliverable", "error"]);
+
+    if (!prospectId) return res.sendStatus(200);
+
+    if (BAD_STATUSES.has(status)) {
       const update = {};
 
       if (type === "sms") {
         update.phone = null;
         update.tags = ["bad_phone"];
-      }
-
-      if (type === "email") {
+      } else if (type === "email") {
         update.email = null;
         update.tags = ["bad_email"];
+      } else {
+        return res.sendStatus(200);
       }
 
-      await fetch(`https://platform.getbonzo.com/api/prospects/${prospectId}`, {
+      const r = await fetch(`https://platform.getbonzo.com/api/prospects/${prospectId}`, {
         method: "PATCH",
         headers: {
           Authorization: `Bearer ${process.env.BONZO_API_KEY}`,
-          "Content-Type": "application/json"
+          "Content-Type": "application/json",
         },
-        body: JSON.stringify(update)
+        body: JSON.stringify(update),
       });
 
-      console.log("Cleaned bad contact:", prospectId);
+      const body = await r.text();
+      console.log("Cleanup result:", r.status, body?.slice(0, 250));
     }
 
-    res.sendStatus(200);
-
+    return res.sendStatus(200);
   } catch (err) {
     console.error("Cleanup error:", err);
-    res.sendStatus(500);
+    return res.sendStatus(500);
   }
 });
 
