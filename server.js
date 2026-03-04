@@ -379,9 +379,9 @@ app.post("/bonzo/event-hook", async (req, res) => {
     const getRes = await fetch(`${baseUrl}/prospects/${prospectId}`, {
       method: "GET",
       headers: {
-        Authorization: `Bearer ${process.env.BONZO_API_KEY}`,
+        Authorization: process.env.BONZO_API_KEY,
         "Content-Type": "application/json",
-      },
+    },
     });
 
     const currentText = await getRes.text();
@@ -410,7 +410,7 @@ app.post("/bonzo/event-hook", async (req, res) => {
     const putRes = await fetch(`${baseUrl}/prospects/${prospectId}`, {
       method: "PUT",
       headers: {
-        Authorization: `Bearer ${process.env.BONZO_API_KEY}`,
+        Authorization: process.env.BONZO_API_KEY,
         "Content-Type": "application/json",
       },
       body: JSON.stringify(current),
