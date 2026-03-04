@@ -1,9 +1,23 @@
-
 import express from "express";
 import fetch from "node-fetch";
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
+
+/**
+ * =========================
+ * ENV VARS YOU NEED ON RENDER
+ * =========================
+ * BONZO_CODE               (your Event Hooks security code)
+ * BONZO_API_KEY            (your Bonzo Personal API access token)
+ * BONZO_BASE_URL           (optional; defaults to https://platform.getbonzo.com/api/v3)
+ *
+ * GOOGLE_CLIENT_ID
+ * GOOGLE_CLIENT_SECRET
+ * GOOGLE_REFRESH_TOKEN
+ */
+
+const BONZO_BASE_URL = process.env.BONZO_BASE_URL || "https://platform.getbonzo.com/api/v3";
 
 // ------------------ HELPERS ------------------
 
@@ -16,7 +30,6 @@ function normalizeEmail(e) {
   return s || "";
 }
 
-// Keep a consistent phone string to STORE (digits, optionally prefixed with +)
 function normalizePhoneForStore(p) {
   if (!p) return "";
   const raw = String(p).trim();
@@ -31,7 +44,7 @@ function last10Digits(d) {
   if (s.length <= 10) return s;
   return s.slice(-10);
 }
-// Fix: this was missing in your current deploy
+
 function ensurePeopleResourceName(resourceName) {
   if (!resourceName) return resourceName;
   return resourceName.startsWith("people/") ? resourceName : `people/${resourceName}`;
@@ -45,25 +58,49 @@ async function readJsonOrText(r) {
     return { ok: r.ok, status: r.status, json: null, text };
   }
 }
-// adding helper for robocallers
+
 function nameLooksLikePhone(first, last) {
   const full = `${first || ""} ${last || ""}`.trim();
-
   if (!full) return true;
 
-  // Remove spaces, dashes, parentheses
   const cleaned = full.replace(/[\s\-\(\)]/g, "");
-
-  // If it's mostly digits, it's probably a phone
   const digitCount = (cleaned.match(/\d/g) || []).length;
-
-  // More than 70% digits = phone/spam
-  if (digitCount / cleaned.length > 0.7) return true;
-
-  // All digits
+  if (cleaned.length > 0 && digitCount / cleaned.length > 0.7) return true;
   if (/^\d+$/.test(cleaned)) return true;
 
   return false;
+}
+
+// ------------------ BONZO API (Bearer Token) ------------------
+// Bonzo expects Authorization: Bearer <token>   [oai_citation:2‡Postman](https://www.postman.com/getbonzo/bonzo-api/request/2y91snq/show-prospect)
+
+function bonzoHeaders() {
+  const token = process.env.BONZO_API_KEY;
+  if (!token) throw new Error("Missing BONZO_API_KEY env var (Personal API access token).");
+  return {
+    Accept: "application/json",
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${token}`,
+  };
+}
+
+async function bonzoGetProspect(prospectId) {
+  const r = await fetch(`${BONZO_BASE_URL}/prospects/${prospectId}`, {
+    method: "GET",
+    headers: bonzoHeaders(),
+  });
+  const out = await readJsonOrText(r);
+  return out;
+}
+
+async function bonzoPutProspect(prospectId, prospectData) {
+  const r = await fetch(`${BONZO_BASE_URL}/prospects/${prospectId}`, {
+    method: "PUT",
+    headers: bonzoHeaders(),
+    body: JSON.stringify(prospectData),
+  });
+  const out = await readJsonOrText(r);
+  return out;
 }
 
 // ------------------ GOOGLE AUTH ------------------
@@ -199,7 +236,6 @@ async function findExistingContact(prospect, accessToken) {
 // ------------------ UPSERT (NO DUPES) ------------------
 
 async function upsertGoogleContact(prospect) {
-  // ❌ Skip if the "name" looks like a phone number (spam/unknown caller behavior)
   if (nameLooksLikePhone(prospect?.first_name, prospect?.last_name)) {
     console.log("Skipping number-as-name contact", {
       first: prospect?.first_name,
@@ -232,52 +268,47 @@ async function upsertGoogleContact(prospect) {
 
   const found = await findExistingContact(prospect, accessToken);
 
-// ---------- UPDATE ----------
-if (found?.resourceName) {
-  const person = await getPerson(found.resourceName, accessToken);
-  const rn = ensurePeopleResourceName(person.resourceName);
+  // UPDATE
+  if (found?.resourceName) {
+    const person = await getPerson(found.resourceName, accessToken);
+    const rn = ensurePeopleResourceName(person.resourceName);
 
-  const updateUrl =
-    `https://people.googleapis.com/v1/${rn}:updateContact` +
-    "?updatePersonFields=names,emailAddresses,phoneNumbers,biographies,organizations";
+    const updateUrl =
+      `https://people.googleapis.com/v1/${rn}:updateContact` +
+      "?updatePersonFields=names,emailAddresses,phoneNumbers,biographies,organizations";
 
-  console.log("Updating resourceName:", rn);
-  console.log("Update URL:", updateUrl);
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const etag =
+        attempt === 1 ? person.etag : (await getPerson(rn, accessToken)).etag;
 
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    const etag =
-      attempt === 1 ? person.etag : (await getPerson(rn, accessToken)).etag;
+      const r = await fetch(updateUrl, {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+          ...(etag ? { "If-Match": etag } : {}),
+        },
+        body: JSON.stringify({ ...body, etag }),
+      });
 
-    const r = await fetch(updateUrl, {
-      method: "PATCH",
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        "Content-Type": "application/json",
-        // keep If-Match too (doesn't hurt), but the body etag is the key fix
-        ...(etag ? { "If-Match": etag } : {}),
-      },
-      // ✅ IMPORTANT: include etag in body
-      body: JSON.stringify({ ...body, etag }),
-    });
+      const out = await readJsonOrText(r);
 
-    const out = await readJsonOrText(r);
+      if (out.ok) {
+        console.log("Updated Google contact:", out.json.resourceName);
+        return out.json;
+      }
 
-    if (out.ok) {
-      console.log("Updated Google contact:", out.json.resourceName);
-      return out.json;
+      if (out.status === 412 && attempt === 1) {
+        console.warn("ETag mismatch (412). Retrying with fresh etag...");
+        continue;
+      }
+
+      console.error("updateContact failed:", out.status, out.json || out.text);
+      throw new Error("Failed to update contact");
     }
-
-    if (out.status === 412 && attempt === 1) {
-      console.warn("ETag mismatch (412). Retrying with fresh etag...");
-      continue;
-    }
-
-    console.error("updateContact failed:", out.status, out.json || out.text);
-    throw new Error("Failed to update contact");
   }
-}
 
-  // ---------- CREATE ----------
+  // CREATE
   const r = await fetch("https://people.googleapis.com/v1/people:createContact", {
     method: "POST",
     headers: {
@@ -298,7 +329,25 @@ if (found?.resourceName) {
   return out.json;
 }
 
-// ------------------ WEBHOOK ------------------
+// ------------------ QUICK TEST ROUTES ------------------
+
+app.get("/health", (req, res) => res.status(200).send("ok"));
+
+/**
+ * TEST BONZO TOKEN + BASE URL:
+ * Visit: https://<your-render-url>/debug/bonzo/prospect/98725114
+ * If auth is right you should see status 200 and the prospect payload.
+ */
+app.get("/debug/bonzo/prospect/:id", async (req, res) => {
+  try {
+    const out = await bonzoGetProspect(req.params.id);
+    return res.status(200).json(out);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
+  }
+});
+
+// ------------------ BONZO EVENT HOOK (Google Contacts sync) ------------------
 
 app.post("/bonzo/events", async (req, res) => {
   try {
@@ -314,18 +363,17 @@ app.post("/bonzo/events", async (req, res) => {
       await upsertGoogleContact(prospect);
     }
 
-    res.status(200).json({ ok: true });
+    return res.status(200).json({ ok: true });
   } catch (err) {
     console.error("Webhook error:", err);
-    res.status(500).send("Server error");
+    return res.status(500).send("Server error");
   }
 });
 
-// ------------------- PUTs updated Clean up Webook in full  ---------------
+// ------------------ BONZO EVENT HOOK (Cleanup bad email/phone) ------------------
 
 app.post("/bonzo/event-hook", async (req, res) => {
   try {
-    // 1) Verify this request is from Bonzo (same style as your /bonzo/events route)
     const code = req.header("x-bonzo-code");
     if (code !== process.env.BONZO_CODE) {
       return res.status(401).send("Unauthorized");
@@ -333,7 +381,6 @@ app.post("/bonzo/event-hook", async (req, res) => {
 
     const { event, additional, prospect } = req.body;
 
-    // Only process outgoing message status updates
     if (event !== "messages.outgoing.updated") {
       return res.status(200).json({ ok: true, ignored: true });
     }
@@ -343,88 +390,67 @@ app.post("/bonzo/event-hook", async (req, res) => {
       return res.status(200).json({ ok: true, ignored: true, reason: "no_message" });
     }
 
-    const status = String(message.status || "").toLowerCase(); // "sent", "error", etc.
-    const type = String(message.type || "").toLowerCase();     // "sms" or "email"
+    const status = String(message.status || "").toLowerCase();
+    const type = String(message.type || "").toLowerCase();
 
-    // IMPORTANT: pick the real prospect id (NOT the message id)
     const prospectId =
-      message?.prospect?.id ||      // safest (nested object)
-      prospect?.id ||               // sometimes top-level prospect is included
-      message?.prospect_id;         // fallback (sometimes this is not the real prospect id)
+      message?.prospect?.id ||
+      prospect?.id ||
+      message?.prospect_id;
 
     console.log("Message update:", { status, type, prospectId, messageId: message.id });
 
-    // Treat "error" as a failure too (your logs show status = error for bad phone numbers)
     const BAD_STATUSES = new Set(["failed", "bounced", "undeliverable", "error"]);
 
     if (!prospectId) {
-      console.log("Cleanup skipped: prospectId missing");
       return res.status(200).json({ ok: true, skipped: true, reason: "no_prospect_id" });
     }
 
-    // Only clean on failure statuses
     if (!BAD_STATUSES.has(status)) {
       return res.status(200).json({ ok: true, skipped: true, reason: "status_not_bad" });
     }
 
-    // Only clean sms/email
     if (type !== "sms" && type !== "email") {
       return res.status(200).json({ ok: true, skipped: true, reason: "type_not_sms_or_email" });
     }
 
-    const baseUrl = process.env.BONZO_BASE_URL || "https://platform.getbonzo.com/api";
+    // 1) GET prospect (Bonzo returns { data: {...} })  [oai_citation:3‡Postman](https://www.postman.com/getbonzo/bonzo-api/request/2y91snq/show-prospect)
+    const getOut = await bonzoGetProspect(prospectId);
 
-    // 2) GET the current prospect (needed because Bonzo supports PUT, not PATCH,
-    // and PUT may require the full object)
-    const getRes = await fetch(`${baseUrl}/prospects/${prospectId}`, {
-      method: "GET",
-      headers: {
-  "X-API-KEY": process.env.BONZO_API_KEY,
-  "Content-Type": "application/json",
-},
-    });
-
-    const currentText = await getRes.text();
-    let current;
-    try {
-      current = JSON.parse(currentText);
-    } catch {
-      current = null;
+    if (!getOut.ok) {
+      console.log("Cleanup skipped: could not GET prospect", getOut.status, getOut.json || getOut.text);
+      return res.status(200).json({ ok: true, skipped: true, reason: "get_failed", status: getOut.status });
     }
 
-    if (!getRes.ok || !current) {
-      console.log("Cleanup skipped: could not GET prospect", getRes.status, currentText?.slice(0, 300));
-      return res.status(200).json({ ok: true, skipped: true, reason: "get_failed" });
-    }
+    const current = getOut.json?.data || getOut.json; // support either shape
 
-    // 3) Modify fields
+    // 2) Modify
+    const updated = { ...current };
+    const tags = Array.isArray(updated.tags) ? updated.tags : [];
+    const tagSet = new Set(tags);
+
     if (type === "sms") {
-      current.phone = null;
-      current.tags = Array.from(new Set([...(current.tags || []), "bad_phone"]));
-    } else if (type === "email") {
-      current.email = null;
-      current.tags = Array.from(new Set([...(current.tags || []), "bad_email"]));
+      updated.phone = null;
+      tagSet.add("bad_phone");
+    } else {
+      updated.email = null;
+      tagSet.add("bad_email");
     }
 
-    // 4) PUT the updated prospect back (Bonzo supports PUT)
-    const putRes = await fetch(`${baseUrl}/prospects/${prospectId}`, {
-      method: "PUT",
-      headers: {
-  "X-API-KEY": process.env.BONZO_API_KEY,
-  "Content-Type": "application/json",
-},
-      body: JSON.stringify(current),
+    updated.tags = Array.from(tagSet);
+
+    // 3) PUT updated prospect
+    const putOut = await bonzoPutProspect(prospectId, updated);
+
+    console.log("Cleanup result:", putOut.status, putOut.json || putOut.text);
+
+    return res.status(200).json({
+      ok: true,
+      cleaned: putOut.ok,
+      putStatus: putOut.status,
     });
-
-    const putBody = await putRes.text();
-    console.log("Cleanup result:", putRes.status, putBody?.slice(0, 300));
-
-    // Return 200 so Bonzo doesn't keep retrying
-    return res.status(200).json({ ok: true, cleaned: putRes.ok, status: putRes.status });
-
   } catch (err) {
     console.error("Cleanup error:", err);
-    // Still return 200 so Bonzo won't retry forever while you're testing
     return res.status(200).json({ ok: false, error: "exception" });
   }
 });
@@ -433,4 +459,5 @@ app.post("/bonzo/event-hook", async (req, res) => {
 
 app.listen(process.env.PORT || 3000, () => {
   console.log("Server running");
+  console.log("Using BONZO_BASE_URL:", BONZO_BASE_URL);
 });
