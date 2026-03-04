@@ -7,8 +7,9 @@ app.use(express.json({ limit: "1mb" }));
 /**
  * ENV REQUIRED:
  *  - BONZO_CODE
- *  - BONZO_API_KEY
+ *  - BONZO_API_KEY           (Bonzo Personal API access token)
  *  - (optional) BONZO_BASE_URL default https://platform.getbonzo.com/api
+ *  - SCAN_SECRET             (to protect /scan-bounces)
  *
  *  - GOOGLE_CLIENT_ID
  *  - GOOGLE_CLIENT_SECRET
@@ -290,48 +291,132 @@ async function upsertGoogleContact(prospect) {
 
 // ------------------ BONZO API HELPERS ------------------
 
-function bonzoBase() {
-  return process.env.BONZO_BASE_URL || "https://platform.getbonzo.com/api";
+function bonzoBaseCandidates() {
+  // Prefer env override first
+  const env = (process.env.BONZO_BASE_URL || "").trim();
+  const bases = [];
+
+  if (env) bases.push(env.replace(/\/$/, ""));
+
+  // Fallbacks (your logs show platform; your webhooks show app)
+  bases.push("https://app.getbonzo.com/api");
+  bases.push("https://platform.getbonzo.com/api");
+
+  // de-dupe
+  return [...new Set(bases)];
+}
+
+function bonzoTokenRaw() {
+  const t = String(process.env.BONZO_API_KEY || "").trim();
+  // If you accidentally saved "Bearer xxx" in Render, normalize it:
+  return t.toLowerCase().startsWith("bearer ") ? t.slice(7).trim() : t;
+}
+
+function authHeaderVariants() {
+  const token = bonzoTokenRaw();
+  if (!token) return [];
+
+  // Try a few common patterns. One of these will usually work.
+  return [
+    { "X-API-KEY": token },
+    { Authorization: `Bearer ${token}` },
+    { "X-Access-Token": token },
+    { "X-Auth-Token": token },
+  ];
+}
+
+async function bonzoFetchAny(path, { method = "GET", body } = {}) {
+  const bases = bonzoBaseCandidates();
+  const authVariants = authHeaderVariants();
+
+  if (!authVariants.length) {
+    throw new Error("Missing BONZO_API_KEY env var");
+  }
+
+  let lastOut = null;
+
+  for (const base of bases) {
+    const url = `${base}${path}`;
+
+    for (const authHeaders of authVariants) {
+      const headers = { ...authHeaders, "Content-Type": "application/json" };
+
+      const r = await fetch(url, {
+        method,
+        headers,
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      });
+
+      const out = await readJsonOrText(r);
+      lastOut = out;
+
+      // Useful logging to see what finally works
+      if (out.status === 401 || out.status === 403) {
+        console.log("Bonzo auth rejected:", { url, method, status: out.status, headersTried: Object.keys(authHeaders) });
+        continue;
+      }
+
+      if (out.status === 404) {
+        console.log("Bonzo route not found:", { url, method, status: out.status });
+        continue;
+      }
+
+      // Anything else (200/201/204, or other errors) — return it so we can see the response
+      if (!out.ok) {
+        console.log("Bonzo request error:", { url, method, status: out.status, body: out.json || out.text });
+      } else {
+        console.log("Bonzo request OK:", { url, method, status: out.status, headersUsed: Object.keys(authHeaders) });
+      }
+
+      return out;
+    }
+  }
+
+  return lastOut || { ok: false, status: 0, json: null, text: "No response" };
 }
 
 async function bonzoGetProspectById(id) {
-  const r = await fetch(`${bonzoBase()}/prospects/${id}`, {
-    method: "GET",
-    headers: { "X-API-KEY": process.env.BONZO_API_KEY, "Content-Type": "application/json" },
-  });
-  const out = await readJsonOrText(r);
-  return out;
+  return await bonzoFetchAny(`/prospects/${id}`, { method: "GET" });
+}
+
+async function bonzoPutProspectFull(id, prospectObj) {
+  return await bonzoFetchAny(`/prospects/${id}`, { method: "PUT", body: prospectObj });
 }
 
 /**
- * Best-effort search:
- * Many CRMs support something like /prospects?query= or /prospects/search.
- * We try a couple common patterns and log what works.
+ * Find prospect(s) by email.
+ * We try several endpoint shapes because some of the old guesses 404 in your logs.
  */
 async function bonzoFindProspectsByEmail(email) {
   const e = normalizeEmail(email);
   if (!e) return [];
 
-  const candidates = [
-    `${bonzoBase()}/prospects?query=${encodeURIComponent(e)}`,
-    `${bonzoBase()}/prospects?search=${encodeURIComponent(e)}`,
-    `${bonzoBase()}/prospects/search?query=${encodeURIComponent(e)}`,
+  const candidatePaths = [
+    // Most common patterns
+    `/prospects?email=${encodeURIComponent(e)}`,
+    `/prospects?query=${encodeURIComponent(e)}`,
+    `/prospects?search=${encodeURIComponent(e)}`,
+    // Sometimes "filter" is used
+    `/prospects?filter=${encodeURIComponent(e)}`,
+    // Sometimes it's a dedicated endpoint
+    `/prospects/search?email=${encodeURIComponent(e)}`,
+    `/prospects/search?query=${encodeURIComponent(e)}`,
   ];
 
-  for (const url of candidates) {
-    const r = await fetch(url, {
-      method: "GET",
-      headers: { "X-API-KEY": process.env.BONZO_API_KEY, "Content-Type": "application/json" },
-    });
+  for (const path of candidatePaths) {
+    const out = await bonzoFetchAny(path, { method: "GET" });
 
-    const out = await readJsonOrText(r);
-    if (!out.ok) {
-      console.log("Bonzo search attempt failed:", url, out.status, out.json || out.text);
+    // If the route doesn't exist, try the next one
+    if (out?.status === 404) continue;
+
+    if (!out?.ok) {
+      // If auth fails here, no other paths will work until auth is fixed,
+      // but we keep going to collect logs.
       continue;
     }
 
-    // try to normalize possible shapes
     const data = out.json;
+
     const list =
       data?.prospects ||
       data?.data ||
@@ -339,20 +424,10 @@ async function bonzoFindProspectsByEmail(email) {
       (Array.isArray(data) ? data : null) ||
       [];
 
-    if (Array.isArray(list) && list.length) return list;
-    if (Array.isArray(list) && list.length === 0) return [];
+    if (Array.isArray(list)) return list;
   }
 
   return [];
-}
-
-async function bonzoPutProspectFull(id, prospectObj) {
-  const r = await fetch(`${bonzoBase()}/prospects/${id}`, {
-    method: "PUT",
-    headers: { "X-API-KEY": process.env.BONZO_API_KEY, "Content-Type": "application/json" },
-    body: JSON.stringify(prospectObj),
-  });
-  return await readJsonOrText(r);
 }
 
 // ------------------ MICROSOFT GRAPH AUTH ------------------
@@ -405,7 +480,6 @@ function extractEmailFromText(text) {
   const t = String(text || "");
   const m = t.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi);
   if (!m || !m.length) return "";
-  // pick first
   return normalizeEmail(m[0]);
 }
 
@@ -536,21 +610,19 @@ app.get("/test-outlook", async (req, res) => {
 });
 
 /**
- * Bounce scan: looks for likely bounce emails in Inbox (top N),
- * extracts the bounced email address, and cleans Bonzo record(s).
- *
- * Call:
+ * Bounce scan:
  *   POST https://bonzo-sync.onrender.com/scan-bounces
+ * Headers:
+ *   x-scan-secret: <SCAN_SECRET>
  * Body (optional):
  *   { "top": 25 }
  */
-
 app.post("/scan-bounces", async (req, res) => {
   const secret = req.header("x-scan-secret");
   if (secret !== process.env.SCAN_SECRET) {
     return res.status(401).send("Unauthorized");
   }
-  
+
   try {
     const mailbox = process.env.OUTLOOK_MAILBOX;
     if (!mailbox) return res.status(500).json({ ok: false, error: "Missing OUTLOOK_MAILBOX env var" });
@@ -569,12 +641,15 @@ app.post("/scan-bounces", async (req, res) => {
     for (const m of items) {
       if (!isBounceSubject(m.subject)) continue;
 
-      const email =
-        extractEmailFromText(m.bodyPreview) ||
-        extractEmailFromText(m.subject);
+      const email = extractEmailFromText(m.bodyPreview) || extractEmailFromText(m.subject);
 
       if (!email) {
-        bounces.push({ subject: m.subject, receivedDateTime: m.receivedDateTime, extractedEmail: "", action: "no_email_found" });
+        bounces.push({
+          subject: m.subject,
+          receivedDateTime: m.receivedDateTime,
+          extractedEmail: "",
+          action: "no_email_found",
+        });
         continue;
       }
 
@@ -582,7 +657,12 @@ app.post("/scan-bounces", async (req, res) => {
       const prospects = await bonzoFindProspectsByEmail(email);
 
       if (!prospects.length) {
-        bounces.push({ subject: m.subject, receivedDateTime: m.receivedDateTime, extractedEmail: email, action: "no_bonzo_match_found" });
+        bounces.push({
+          subject: m.subject,
+          receivedDateTime: m.receivedDateTime,
+          extractedEmail: email,
+          action: "no_bonzo_match_found",
+        });
         continue;
       }
 
