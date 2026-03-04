@@ -321,12 +321,60 @@ app.post("/bonzo/events", async (req, res) => {
   }
 });
 
-// ------------------- Clean up Webook ---------------
+// ------------------- Clean up Webook in full  ---------------
 
-app.post("/bonzo/event-hook", (req, res) => {
-  console.log("BONZO EVENT:", JSON.stringify(req.body, null, 2));
-  res.sendStatus(200);
+app.post("/bonzo/event-hook", async (req, res) => {
+  try {
+
+    const { event, additional } = req.body;
+
+    if (event !== "messages.outgoing.updated") {
+      return res.sendStatus(200);
+    }
+
+    const message = additional?.message;
+    if (!message) return res.sendStatus(200);
+
+    const status = message.status;
+    const type = message.type;
+    const prospectId = message.prospect_id;
+
+    console.log("Message update:", status, type, prospectId);
+
+    if (["failed", "bounced", "undeliverable"].includes(status)) {
+
+      const update = {};
+
+      if (type === "sms") {
+        update.phone = null;
+        update.tags = ["bad_phone"];
+      }
+
+      if (type === "email") {
+        update.email = null;
+        update.tags = ["bad_email"];
+      }
+
+      await fetch(`https://platform.getbonzo.com/api/prospects/${prospectId}`, {
+        method: "PATCH",
+        headers: {
+          Authorization: `Bearer ${process.env.BONZO_API_KEY}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(update)
+      });
+
+      console.log("Cleaned bad contact:", prospectId);
+    }
+
+    res.sendStatus(200);
+
+  } catch (err) {
+    console.error("Cleanup error:", err);
+    res.sendStatus(500);
+  }
 });
+
 // ------------------ START SERVER ------------------
 
 app.listen(process.env.PORT || 3000, () => {
