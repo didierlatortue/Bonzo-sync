@@ -544,7 +544,13 @@ app.get("/test-outlook", async (req, res) => {
  * Body (optional):
  *   { "top": 25 }
  */
+
 app.post("/scan-bounces", async (req, res) => {
+  const secret = req.header("x-scan-secret");
+  if (secret !== process.env.SCAN_SECRET) {
+    return res.status(401).send("Unauthorized");
+  }
+  
   try {
     const mailbox = process.env.OUTLOOK_MAILBOX;
     if (!mailbox) return res.status(500).json({ ok: false, error: "Missing OUTLOOK_MAILBOX env var" });
