@@ -7,9 +7,8 @@ app.use(express.json({ limit: "1mb" }));
 /**
  * ENV REQUIRED:
  *  - BONZO_CODE
- *  - BONZO_API_KEY           (Bonzo Personal API access token)
+ *  - BONZO_API_KEY
  *  - (optional) BONZO_BASE_URL default https://platform.getbonzo.com/api
- *  - SCAN_SECRET             (to protect /scan-bounces)
  *
  *  - GOOGLE_CLIENT_ID
  *  - GOOGLE_CLIENT_SECRET
@@ -295,25 +294,18 @@ function bonzoBase() {
   return process.env.BONZO_BASE_URL || "https://platform.getbonzo.com/api";
 }
 
-// ✅ Bonzo expects Bearer token auth
-function bonzoAuthHeaders() {
-  const token = process.env.BONZO_API_KEY;
-  return {
-    Authorization: `Bearer ${token}`,
-    "Content-Type": "application/json",
-  };
-}
-
 async function bonzoGetProspectById(id) {
   const r = await fetch(`${bonzoBase()}/prospects/${id}`, {
     method: "GET",
-    headers: bonzoAuthHeaders(),
+    headers: { "X-API-KEY": process.env.BONZO_API_KEY, "Content-Type": "application/json" },
   });
-  return await readJsonOrText(r);
+  const out = await readJsonOrText(r);
+  return out;
 }
 
 /**
  * Best-effort search:
+ * Many CRMs support something like /prospects?query= or /prospects/search.
  * We try a couple common patterns and log what works.
  */
 async function bonzoFindProspectsByEmail(email) {
@@ -329,7 +321,7 @@ async function bonzoFindProspectsByEmail(email) {
   for (const url of candidates) {
     const r = await fetch(url, {
       method: "GET",
-      headers: bonzoAuthHeaders(),
+      headers: { "X-API-KEY": process.env.BONZO_API_KEY, "Content-Type": "application/json" },
     });
 
     const out = await readJsonOrText(r);
@@ -338,6 +330,7 @@ async function bonzoFindProspectsByEmail(email) {
       continue;
     }
 
+    // try to normalize possible shapes
     const data = out.json;
     const list =
       data?.prospects ||
@@ -356,7 +349,7 @@ async function bonzoFindProspectsByEmail(email) {
 async function bonzoPutProspectFull(id, prospectObj) {
   const r = await fetch(`${bonzoBase()}/prospects/${id}`, {
     method: "PUT",
-    headers: bonzoAuthHeaders(),
+    headers: { "X-API-KEY": process.env.BONZO_API_KEY, "Content-Type": "application/json" },
     body: JSON.stringify(prospectObj),
   });
   return await readJsonOrText(r);
@@ -412,6 +405,7 @@ function extractEmailFromText(text) {
   const t = String(text || "");
   const m = t.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi);
   if (!m || !m.length) return "";
+  // pick first
   return normalizeEmail(m[0]);
 }
 
@@ -542,19 +536,21 @@ app.get("/test-outlook", async (req, res) => {
 });
 
 /**
- * Bounce scan:
+ * Bounce scan: looks for likely bounce emails in Inbox (top N),
+ * extracts the bounced email address, and cleans Bonzo record(s).
+ *
+ * Call:
  *   POST https://bonzo-sync.onrender.com/scan-bounces
- * Headers:
- *   x-scan-secret: <SCAN_SECRET>
  * Body (optional):
  *   { "top": 25 }
  */
+
 app.post("/scan-bounces", async (req, res) => {
   const secret = req.header("x-scan-secret");
   if (secret !== process.env.SCAN_SECRET) {
     return res.status(401).send("Unauthorized");
   }
-
+  
   try {
     const mailbox = process.env.OUTLOOK_MAILBOX;
     if (!mailbox) return res.status(500).json({ ok: false, error: "Missing OUTLOOK_MAILBOX env var" });
@@ -573,15 +569,12 @@ app.post("/scan-bounces", async (req, res) => {
     for (const m of items) {
       if (!isBounceSubject(m.subject)) continue;
 
-      const email = extractEmailFromText(m.bodyPreview) || extractEmailFromText(m.subject);
+      const email =
+        extractEmailFromText(m.bodyPreview) ||
+        extractEmailFromText(m.subject);
 
       if (!email) {
-        bounces.push({
-          subject: m.subject,
-          receivedDateTime: m.receivedDateTime,
-          extractedEmail: "",
-          action: "no_email_found",
-        });
+        bounces.push({ subject: m.subject, receivedDateTime: m.receivedDateTime, extractedEmail: "", action: "no_email_found" });
         continue;
       }
 
@@ -589,12 +582,7 @@ app.post("/scan-bounces", async (req, res) => {
       const prospects = await bonzoFindProspectsByEmail(email);
 
       if (!prospects.length) {
-        bounces.push({
-          subject: m.subject,
-          receivedDateTime: m.receivedDateTime,
-          extractedEmail: email,
-          action: "no_bonzo_match_found",
-        });
+        bounces.push({ subject: m.subject, receivedDateTime: m.receivedDateTime, extractedEmail: email, action: "no_bonzo_match_found" });
         continue;
       }
 
