@@ -1,0 +1,18 @@
+name: Scan Outlook Bounces
+
+on:
+  schedule:
+    - cron: "*/1 * * * *"   # every 1 minute
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Call scan endpoint
+        run: |
+          curl -X POST https://bonzo-sync.onrender.com/scan-bounces \
+          -H "Content-Type: application/json" \
+          -H "x-scan-secret: ${{ secrets.SCAN_SECRET }}" \
+          -d '{"top":50}'
