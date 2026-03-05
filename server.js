@@ -46,6 +46,39 @@ function nameLooksLikePhone(first, last) {
   if (/^\d+$/.test(cleaned)) return true;
   return false;
 }
+function dedupeStrings(arr) {
+  return Array.from(new Set([].concat(arr || []).map((x) => String(x || "").trim()).filter(Boolean)));
+}
+function safeStr(x, max = 500) {
+  const s = String(x || "");
+  return s.length > max ? s.slice(0, max) + "…" : s;
+}
+
+// Try to extract a destination phone from various Bonzo message shapes
+function extractPhoneFromMessage(message) {
+  const candidates = [
+    message && message.to,
+    message && message.to_number,
+    message && message.toNumber,
+    message && message.destination,
+    message && message.destination_number,
+    message && message.destinationNumber,
+    message && message.phone,
+    message && message.phone_number,
+    message && message.phoneNumber,
+    message && message.recipient,
+    message && message.recipient_phone,
+    message && message.recipientPhone,
+    message && message.contact && message.contact.phone,
+    message && message.contact && message.contact.phone_number,
+    message && message.contact && message.contact.phoneNumber,
+  ];
+  for (const c of candidates) {
+    const d = digitsOnly(c);
+    if (d && d.length >= 7) return d;
+  }
+  return "";
+}
 
 // =========================
 // BONZO (v3)
@@ -54,41 +87,80 @@ function bonzoBase() {
   // IMPORTANT: BONZO_BASE_URL=https://app.getbonzo.com/api/v3
   return String(process.env.BONZO_BASE_URL || "https://app.getbonzo.com/api/v3").replace(/\/+$/, "");
 }
-function bonzoHeaders() {
+
+/**
+ * AUTH MODES
+ * - bearer (default): Authorization: Bearer <token>
+ * - x-api-key: X-API-KEY: <token>
+ * - auto: try bearer; if 401/403 retry once with X-API-KEY (or vice versa if forced)
+ */
+function bonzoAuthMode() {
+  return String(process.env.BONZO_AUTH_MODE || "bearer").trim().toLowerCase(); // bearer|x-api-key|auto
+}
+
+function bonzoHeaders(mode) {
   const key = String(process.env.BONZO_API_KEY || "").trim();
   const base = { "Content-Type": "application/json", Accept: "application/json" };
   if (!key) return base;
-  // Your token works as Bearer against v3.
+
+  const m = String(mode || bonzoAuthMode()).toLowerCase();
+  if (m === "x-api-key" || m === "x_api_key" || m === "xapikey") {
+    return Object.assign({}, base, { "X-API-KEY": key });
+  }
+  // default: bearer
   return Object.assign({}, base, { Authorization: "Bearer " + key });
 }
+
+function authPreview(headers) {
+  if (headers.Authorization) return "Authorization: " + String(headers.Authorization).slice(0, 40) + "...";
+  if (headers["X-API-KEY"]) return "X-API-KEY: " + String(headers["X-API-KEY"]).slice(0, 8) + "...";
+  if (headers["x-api-key"]) return "x-api-key: " + String(headers["x-api-key"]).slice(0, 8) + "...";
+  return "(none)";
+}
+
 async function bonzoFetch(path, opts) {
   opts = opts || {};
   const url = bonzoBase() + path;
-  const headers = Object.assign({}, bonzoHeaders(), opts.headers || {});
 
-  const authPreview = headers.Authorization
-    ? "Authorization: " + String(headers.Authorization).slice(0, 40) + "..."
-    : "(none)";
+  const mode = opts._authMode || bonzoAuthMode();
+  const headers = Object.assign({}, bonzoHeaders(mode), opts.headers || {});
 
   console.log("[bonzoFetch] " + (opts.method || "GET") + " " + url);
-  console.log("[bonzoFetch] Auth preview: " + authPreview);
+  console.log("[bonzoFetch] Auth preview:", authPreview(headers));
 
   const r = await fetch(url, Object.assign({}, opts, { headers }));
   const out = await readJsonOrText(r);
-  console.log("[bonzoFetch] status: " + out.status);
-  console.log("[bonzoFetch] body: " + JSON.stringify(out.json || out.text || "").slice(0, 500));
+
+  console.log("[bonzoFetch] status:", out.status);
+  console.log("[bonzoFetch] body:", safeStr(JSON.stringify(out.json || out.text || ""), 1200));
+
+  // AUTO fallback auth retry ONCE if unauthorized/forbidden
+  const shouldRetry =
+    String(mode).toLowerCase() === "auto" &&
+    (out.status === 401 || out.status === 403) &&
+    !opts._authRetried &&
+    String(process.env.BONZO_API_KEY || "").trim();
+
+  if (shouldRetry) {
+    const retryMode = headers.Authorization ? "x-api-key" : "bearer";
+    console.log("[bonzoFetch] AUTH RETRY with:", retryMode);
+    return bonzoFetch(path, Object.assign({}, opts, { _authRetried: true, _authMode: retryMode }));
+  }
+
   return out;
 }
+
 async function bonzoGetProspectById(id) {
   const out = await bonzoFetch("/prospects/" + encodeURIComponent(id), { method: "GET" });
   // Unwrap v3 { data: {...} }
   if (out.ok && out.json && out.json.data) out.json = out.json.data;
   return out;
 }
+
 async function bonzoPutProspectFull(id, obj) {
   const body = JSON.stringify(obj);
   console.log("[bonzoFetch] PUT payload keys:", Object.keys(obj || {}));
-  console.log("[bonzoFetch] PUT payload preview:", body.slice(0, 1200));
+  console.log("[bonzoFetch] PUT payload preview:", safeStr(body, 1400));
   const out = await bonzoFetch("/prospects/" + encodeURIComponent(id), { method: "PUT", body });
   if (out.ok && out.json && out.json.data) out.json = out.json.data;
   return out;
@@ -97,7 +169,9 @@ async function bonzoPutProspectFull(id, obj) {
 /**
  * SAFE UPDATE:
  * Bonzo v3 behaves like PUT=replace, so we always GET, merge, then PUT full.
- * This prevents wiping fields (like the “deleted all emails” incident).
+ * Guardrails included:
+ * - Never drop existing tags: patch.tags are MERGED with current tags
+ * - Dedupe tags always
  */
 async function bonzoSafeUpdateProspect(id, patch) {
   const getOut = await bonzoGetProspectById(id);
@@ -109,12 +183,10 @@ async function bonzoSafeUpdateProspect(id, patch) {
   // Merge patch (top-level only)
   for (const k of Object.keys(patch || {})) updated[k] = patch[k];
 
-  // Ensure tags are de-duped if provided
-  if (patch && patch.tags) {
-    updated.tags = Array.from(new Set([].concat(patch.tags || []))).filter(Boolean);
-  } else {
-    updated.tags = Array.from(new Set([].concat(updated.tags || []))).filter(Boolean);
-  }
+  // TAGS GUARDRAIL: always merge, never replace
+  const currentTags = [].concat(current && current.tags ? current.tags : []);
+  const patchTags = patch && patch.tags ? [].concat(patch.tags) : [];
+  updated.tags = dedupeStrings(currentTags.concat(patchTags));
 
   return bonzoPutProspectFull(id, updated);
 }
@@ -165,13 +237,15 @@ app.get("/debug-bonzo", async (req, res) => {
   const id = req.query.id || "98725114";
   const base = bonzoBase();
   const keyLen = String(process.env.BONZO_API_KEY || "").trim().length;
+  const mode = bonzoAuthMode();
   const out = await bonzoGetProspectById(id);
   return res.json({
     base,
     keyLen,
+    mode,
     status: out.status,
     ok: out.ok,
-    body: JSON.stringify(out.json || out.text || "").slice(0, 1200),
+    body: safeStr(JSON.stringify(out.json || out.text || ""), 1200),
   });
 });
 
@@ -365,6 +439,10 @@ function isBounceSubject(subject) {
     s.includes("bounce")
   );
 }
+function isLikelyBounceSender(fromAddress) {
+  const a = String(fromAddress || "").toLowerCase();
+  return a.includes("mailer-daemon") || a.includes("postmaster") || a.includes("msprvs1") || a.includes("mail delivery");
+}
 const seenMessageIds = new Map();
 function markSeen(id) {
   if (id) seenMessageIds.set(id, Date.now());
@@ -397,6 +475,11 @@ app.post("/bonzo/events", async (req, res) => {
 
 /**
  * Phone cleanup via Bonzo message status (SMS only)
+ * Guardrails:
+ * - ONLY for SMS types AND bad statuses
+ * - Confirm the failed message destination phone matches the prospect phone (last10)
+ *   If we can’t confidently match, we SKIP instead of wiping.
+ * - Tags are MERGED, so "bad_phone" won’t delete existing tags
  */
 app.post("/bonzo/event-hook", async (req, res) => {
   try {
@@ -428,13 +511,28 @@ app.post("/bonzo/event-hook", async (req, res) => {
     }
 
     const current = getOut.json;
-    const tags = Array.from(new Set([...(current.tags || []), "bad_phone"]));
 
-    // Some CRMs won’t clear with null; empty string is safer.
+    // GUARDRAIL: match message destination phone to current phone (last10)
+    const currentDigits = digitsOnly(normalizePhoneForStore(current && current.phone));
+    const msgDigits = extractPhoneFromMessage(message);
+    const currentLast10 = last10Digits(currentDigits);
+    const msgLast10 = last10Digits(msgDigits);
+
+    if (!currentDigits) {
+      return res.status(200).json({ ok: true, skipped: true, reason: "no_current_phone" });
+    }
+    if (!msgDigits) {
+      return res.status(200).json({ ok: true, skipped: true, reason: "no_message_phone_for_match" });
+    }
+    if (currentLast10 && msgLast10 && currentLast10.length === 10 && msgLast10.length === 10 && currentLast10 !== msgLast10) {
+      console.log("[bad_phone] SKIP mismatch:", { currentLast10, msgLast10 });
+      return res.status(200).json({ ok: true, skipped: true, reason: "phone_mismatch_guardrail" });
+    }
+
     const putOut = await bonzoSafeUpdateProspect(prospectId, {
-      phone: "",
+      phone: "", // empty string clears more reliably than null
       phone_type: "invalid",
-      tags,
+      tags: ["bad_phone"], // MERGED with existing tags inside bonzoSafeUpdateProspect
     });
 
     console.log("Cleanup result:", putOut.status, putOut.json || putOut.text);
@@ -473,6 +571,13 @@ app.get("/test-outlook", async (req, res) => {
 
 /**
  * Email cleanup via Outlook bounce scan (manual trigger)
+ * Guardrails:
+ * - SECRET required
+ * - Exact-email match required for clearing (hard stop)
+ * - Cap broad matches with maxMatchesSafety
+ * - Cap total cleans with maxCleans
+ * - Optional dryRun (default false): compute actions but do not PUT
+ * - Tags are MERGED so "bad_email" is added even if "bad_phone" already exists
  */
 app.post("/scan-bounces", async (req, res) => {
   const secret = req.header("x-scan-secret");
@@ -486,6 +591,7 @@ app.post("/scan-bounces", async (req, res) => {
     const top = Math.min(Math.max(Number((req.body && req.body.top) || 25), 1), 100);
     const maxMatchesSafety = Math.min(Math.max(Number((req.body && req.body.maxMatchesSafety) || 5), 1), 25);
     const maxCleans = Math.min(Math.max(Number((req.body && req.body.maxCleans) || 10), 1), 50);
+    const dryRun = Boolean(req.body && req.body.dryRun);
 
     const token = await getMsGraphToken();
     const data = await graphGet(
@@ -507,19 +613,24 @@ app.post("/scan-bounces", async (req, res) => {
       if (isSeen(m.id)) continue;
       markSeen(m.id);
 
-      if (!isBounceSubject(m.subject)) continue;
+      const fromAddr = (m.from && m.from.emailAddress && m.from.emailAddress.address) || "";
+      const subjectBounce = isBounceSubject(m.subject);
+      const senderBounce = isLikelyBounceSender(fromAddr);
+
+      // If it doesn't look like a bounce by subject, skip (sender heuristic is secondary)
+      if (!subjectBounce && !senderBounce) continue;
 
       const extracted = extractEmailFromText(m.bodyPreview) || extractEmailFromText(m.subject);
       const bouncedEmail = normalizeEmail(extracted);
 
       if (!bouncedEmail) {
-        results.push({ id: m.id, subject: m.subject, extractedEmail: "", action: "no_email_found" });
+        results.push({ id: m.id, subject: m.subject, from: fromAddr, extractedEmail: "", action: "no_email_found" });
         continue;
       }
 
       let matches = await bonzoFindProspectsByEmail(bouncedEmail);
 
-      // If search returned broad results, filter exact email matches again here
+      // Hard safety: require exact matches for clearing
       const exactMatches = matches.filter((p) => normalizeEmail(p && p.email) === bouncedEmail);
 
       // Safety: if too many results and no exact matches, do nothing
@@ -528,6 +639,7 @@ app.post("/scan-bounces", async (req, res) => {
         results.push({
           id: m.id,
           subject: m.subject,
+          from: fromAddr,
           extractedEmail: bouncedEmail,
           action: "safety_skip_too_many_matches",
           matches: matches.length,
@@ -536,8 +648,22 @@ app.post("/scan-bounces", async (req, res) => {
         continue;
       }
 
-      // Prefer exact matches; otherwise, proceed with what we have (but capped)
-      const toClean = (exactMatches.length ? exactMatches : matches).slice(0, maxMatchesSafety);
+      // If no exact matches, do not clean (guardrail)
+      if (!exactMatches.length) {
+        results.push({
+          id: m.id,
+          subject: m.subject,
+          from: fromAddr,
+          extractedEmail: bouncedEmail,
+          action: "no_exact_matches_guardrail",
+          matches: matches.length,
+          exactMatches: 0,
+          cleanedCount: 0,
+        });
+        continue;
+      }
+
+      const toClean = exactMatches.slice(0, maxMatchesSafety);
 
       let cleanedCount = 0;
       for (const p of toClean) {
@@ -552,14 +678,17 @@ app.post("/scan-bounces", async (req, res) => {
         const current = getOut.json;
         const currentEmail = normalizeEmail(current && current.email);
 
-        // Extra safety: only clear if it matches the bounced email
-        if (currentEmail && currentEmail !== bouncedEmail) continue;
+        // Extra safety: only clear if it matches the bounced email (required)
+        if (!currentEmail || currentEmail !== bouncedEmail) continue;
 
-        const tags = Array.from(new Set([...(current.tags || []), "bad_email"]));
+        if (dryRun) {
+          cleanedCount++;
+          continue;
+        }
 
         const putOut = await bonzoSafeUpdateProspect(pid, {
           email: "",
-          tags,
+          tags: ["bad_email"], // MERGED with existing tags inside bonzoSafeUpdateProspect
         });
 
         if (putOut.ok) {
@@ -571,11 +700,13 @@ app.post("/scan-bounces", async (req, res) => {
       results.push({
         id: m.id,
         subject: m.subject,
+        from: fromAddr,
         extractedEmail: bouncedEmail,
-        action: cleanedCount ? "cleaned" : "no_safe_matches",
+        action: dryRun ? (cleanedCount ? "dry_run_would_clean" : "dry_run_no_safe_matches") : cleanedCount ? "cleaned" : "no_safe_matches",
         matches: matches.length,
         exactMatches: exactMatches.length,
         cleanedCount,
+        dryRun,
       });
     }
 
@@ -583,7 +714,8 @@ app.post("/scan-bounces", async (req, res) => {
       ok: true,
       scanned: items.length,
       bouncesProcessed: results.length,
-      totalCleans,
+      totalCleans: dryRun ? 0 : totalCleans,
+      dryRun,
       results,
     });
   } catch (e) {
