@@ -46,14 +46,27 @@ function nameLooksLikePhone(first, last) {
   if (/^\d+$/.test(cleaned)) return true;
   return false;
 }
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+// Tags in Bonzo sometimes come back as objects. Normalize to tag-name strings.
+function getTagNames(tags) {
+  const arr = Array.isArray(tags) ? tags : [];
+  return arr
+    .map((t) => {
+      if (!t) return "";
+      if (typeof t === "string") return t.trim();
+      if (typeof t === "object") return String(t.name || t.title || "").trim();
+      return String(t).trim();
+    })
+    .filter(Boolean);
+}
 function uniqTags(tags) {
-  return Array.from(new Set([].concat(tags || []).filter(Boolean)));
+  return Array.from(new Set([].concat(tags || []).map((t) => String(t).trim()).filter(Boolean)));
 }
 function addTags(existing, toAdd) {
   return uniqTags([...(existing || []), ...(toAdd || [])]);
-}
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
 }
 
 // =========================
@@ -152,6 +165,30 @@ async function bonzoGetProspectById(id) {
   if (out.ok && out.json && out.json.data) out.json = out.json.data;
   return out;
 }
+
+// --- PATCH-first updater (fixes your “PUT overwrote fields” issue) ---
+function sanitizePatch(patch) {
+  const p = Object.assign({}, patch || {});
+  // Remove undefined keys so we don't accidentally send them
+  for (const k of Object.keys(p)) {
+    if (typeof p[k] === "undefined") delete p[k];
+  }
+  // Always keep tags as simple string names
+  if (Array.isArray(p.tags)) p.tags = uniqTags(getTagNames(p.tags));
+  return p;
+}
+
+async function bonzoPatchProspect(id, patch) {
+  const clean = sanitizePatch(patch);
+  const body = JSON.stringify(clean);
+  console.log("[bonzoFetch] PATCH payload keys:", Object.keys(clean || {}));
+  console.log("[bonzoFetch] PATCH payload preview:", body.slice(0, 1200));
+  const out = await bonzoFetch("/prospects/" + encodeURIComponent(id), { method: "PATCH", body });
+  if (out.ok && out.json && out.json.data) out.json = out.json.data;
+  return out;
+}
+
+// Fallback only if Bonzo rejects PATCH. We keep it safe by GET+merge+PUT.
 async function bonzoPutProspectFull(id, obj) {
   const body = JSON.stringify(obj);
   console.log("[bonzoFetch] PUT payload keys:", Object.keys(obj || {}));
@@ -161,27 +198,36 @@ async function bonzoPutProspectFull(id, obj) {
   return out;
 }
 
-/**
- * SAFE UPDATE:
- * Bonzo v3 behaves like PUT=replace, so we always GET, merge, then PUT full.
- * This prevents wiping fields (like the “deleted all emails” incident).
- */
-async function bonzoSafeUpdateProspect(id, patch) {
+// If PATCH works, we never risk wiping other fields.
+// If PATCH is not allowed by Bonzo, we safely fall back.
+async function bonzoUpdateProspect(id, patch) {
+  const patchOut = await bonzoPatchProspect(id, patch);
+  if (patchOut.ok) return patchOut;
+
+  // Only fallback on “method not allowed / unsupported”
+  const maybeUnsupported = patchOut.status === 405 || patchOut.status === 404 || patchOut.status === 400;
+  if (!maybeUnsupported) return patchOut;
+
+  console.log("[bonzoUpdateProspect] PATCH may be unsupported; falling back to GET+PUT merge.");
+
   const getOut = await bonzoGetProspectById(id);
   if (!getOut.ok || !getOut.json) return getOut;
 
   const current = getOut.json;
-  const updated = { ...current };
+  const merged = { ...current };
 
-  // Merge patch (top-level only)
-  for (const k of Object.keys(patch || {})) updated[k] = patch[k];
+  const clean = sanitizePatch(patch);
+  for (const k of Object.keys(clean)) merged[k] = clean[k];
 
-  // Tags guardrail:
-  // - If patch.tags provided, caller should have already UNION'ed with current.tags
-  // - Still de-dupe here
-  updated.tags = uniqTags(updated.tags);
+  // Ensure tags are unioned when patch contains tags; do not overwrite silently.
+  if (clean.tags) {
+    merged.tags = uniqTags(addTags(getTagNames(current.tags), clean.tags));
+  } else {
+    // Keep whatever Bonzo gave us
+    merged.tags = current.tags;
+  }
 
-  return bonzoPutProspectFull(id, updated);
+  return bonzoPutProspectFull(id, merged);
 }
 
 /**
@@ -503,6 +549,7 @@ app.post("/bonzo/events", async (req, res) => {
 
 /**
  * Phone cleanup via Bonzo message status (SMS only)
+ * Fix: PATCH-only updates so we never wipe email/tags accidentally.
  */
 app.post("/bonzo/event-hook", async (req, res) => {
   try {
@@ -534,19 +581,18 @@ app.post("/bonzo/event-hook", async (req, res) => {
     }
 
     const current = getOut.json;
+    const currentTags = getTagNames(current.tags);
+    const nextTags = addTags(currentTags, ["bad_phone"]); // ✅ always union
 
-    // IMPORTANT: Always UNION tags (never overwrite)
-    const tags = addTags(current.tags || [], ["bad_phone"]);
-
-    // Some CRMs won’t clear with null; empty string is safer.
-    const putOut = await bonzoSafeUpdateProspect(prospectId, {
+    // Clear phone only; do NOT send email field at all.
+    const updOut = await bonzoUpdateProspect(prospectId, {
       phone: "",
       phone_type: "invalid",
-      tags,
+      tags: nextTags,
     });
 
-    console.log("Cleanup result:", putOut.status, putOut.json || putOut.text);
-    return res.status(200).json({ ok: true, cleaned: putOut.ok, status: putOut.status });
+    console.log("Cleanup result:", updOut.status, updOut.json || updOut.text);
+    return res.status(200).json({ ok: true, cleaned: updOut.ok, status: updOut.status });
   } catch (err) {
     console.error("Cleanup error:", err);
     return res.status(200).json({ ok: false, error: "exception" });
@@ -588,6 +634,8 @@ app.get("/test-outlook", async (req, res) => {
  * - maxMatchesSafety cap
  * - ALWAYS verify exact email by GET /prospects/:id before clearing
  * - optional dryRun
+ *
+ * Fix: PATCH-only updates so we never wipe phone/tags accidentally.
  */
 app.post("/scan-bounces", async (req, res) => {
   const secret = req.header("x-scan-secret");
@@ -646,30 +694,24 @@ app.post("/scan-bounces", async (req, res) => {
         continue;
       }
 
-      // Step 1: Get candidate list (may be broad)
-      const candidates = await bonzoFindProspectCandidatesByEmail(bouncedEmail);
-
-      // Step 2 (critical): Resolve exact matches by GET /prospects/:id (capped)
+      // Resolve exact matches by GET /prospects/:id (capped)
       const exactProspects = await bonzoResolveExactProspectsByEmail(bouncedEmail, {
-        maxCandidates: Math.max(25, candidates.length || 25),
+        maxCandidates: 50,
         maxDetailChecks: Math.max(10, maxMatchesSafety * 4),
         perItemDelayMs: 80,
       });
 
-      // If we couldn't find any exact matches after verification, do nothing safely.
       if (!exactProspects.length) {
         results.push({
           id: m.id,
           subject: m.subject,
           extractedEmail: bouncedEmail,
           action: "no_exact_matches_after_verify",
-          candidates: candidates.length,
-          verifiedChecked: Math.max(0, Math.min(Math.max(10, maxMatchesSafety * 4), (candidates || []).length || 0)),
+          exactVerified: 0,
         });
         continue;
       }
 
-      // Clean up to maxMatchesSafety exact matches
       const toClean = exactProspects.slice(0, maxMatchesSafety);
 
       let cleanedCount = 0;
@@ -691,7 +733,7 @@ app.post("/scan-bounces", async (req, res) => {
         // Absolute safety: only clear if it matches the bounced email
         if (!currentEmail || currentEmail !== bouncedEmail) continue;
 
-        const nextTags = addTags(current.tags || [], ["bad_email"]); // ✅ unions even if bad_phone already exists
+        const nextTags = addTags(getTagNames(current.tags), ["bad_email"]); // ✅ unions even if bad_phone already exists
 
         if (dryRun) {
           cleanedCount++;
@@ -699,12 +741,13 @@ app.post("/scan-bounces", async (req, res) => {
           continue;
         }
 
-        const putOut = await bonzoSafeUpdateProspect(pid, {
+        // Clear email only; do NOT send phone field at all.
+        const updOut = await bonzoUpdateProspect(pid, {
           email: "",
           tags: nextTags,
         });
 
-        if (putOut.ok) {
+        if (updOut.ok) {
           cleanedCount++;
           cleanedIds.push(pid);
           totalCleans++;
@@ -716,7 +759,6 @@ app.post("/scan-bounces", async (req, res) => {
         subject: m.subject,
         extractedEmail: bouncedEmail,
         action: cleanedCount ? (dryRun ? "dry_run_would_clean" : "cleaned") : "no_safe_matches",
-        candidates: candidates.length,
         exactVerified: exactProspects.length,
         cleanedCount,
         cleanedIds,
