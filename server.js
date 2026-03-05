@@ -97,9 +97,16 @@ async function bonzoGetProspectById(id) {
 }
 
 async function bonzoPutProspectFull(id, obj) {
-  const out = await bonzoFetch("/prospects/" + id, { method: "PUT", body: JSON.stringify(obj) });
+  const body = JSON.stringify(obj);
+
+  console.log("[bonzoFetch] PUT payload keys:", Object.keys(obj || {}));
+  console.log("[bonzoFetch] PUT payload preview:", body.slice(0, 1200));
+
+  const out = await bonzoFetch("/prospects/" + id, { method: "PUT", body });
+
   // Unwrap v3 { data: {...} }
   if (out.ok && out.json && out.json.data) out.json = out.json.data;
+
   return out;
 }
 
@@ -468,17 +475,21 @@ app.post("/bonzo/event-hook", async (req, res) => {
 
     // Ensure we're editing the prospect object (not {data:{...}})
     const current = getOut.json;
-    const updated = { ...current };
 
-    if (type === "sms") {
-      updated.phone = null;
-      updated.tags = Array.from(new Set([].concat(updated.tags || [], ["bad_phone"])));
-    } else {
-      updated.email = null;
-      updated.tags = Array.from(new Set([].concat(updated.tags || [], ["bad_email"])));
-    }
+const patch = {
+  data: {}
+};
 
-    const putOut = await bonzoPutProspectFull(prospectId, updated);
+if (type === "sms") {
+  patch.data.phone = null;
+  patch.data.phone_type = "invalid";
+  patch.data.tags = Array.from(new Set([...(current.tags || []), "bad_phone"]));
+} else {
+  patch.data.email = null;
+  patch.data.tags = Array.from(new Set([...(current.tags || []), "bad_email"]));
+}
+
+const putOut = await bonzoPutProspectFull(prospectId, patch);
     console.log("Cleanup result:", putOut.status, putOut.json || putOut.text);
     return res.status(200).json({ ok: true, cleaned: putOut.ok, status: putOut.status });
   } catch (err) {
