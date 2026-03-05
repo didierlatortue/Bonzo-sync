@@ -2,26 +2,22 @@ import express from "express";
 import fetch from "node-fetch";
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "2mb" }));
 
 /**
- * ENV REQUIRED:
- *  - BONZO_CODE
- *  - BONZO_API_KEY
- *  - BONZO_AUTH_MODE  (bearer | raw | xapikey)  <-- IMPORTANT
- *  - (optional) BONZO_BASE_URL default https://app.getbonzo.com/api
+ * =========================
+ * ENV VARS YOU NEED ON RENDER
+ * =========================
+ * BONZO_CODE               (your Event Hooks security code)
+ * BONZO_API_KEY            (your Bonzo Personal API access token)
+ * BONZO_BASE_URL           (optional; defaults to https://platform.getbonzo.com/api/v3)
  *
- *  - GOOGLE_CLIENT_ID
- *  - GOOGLE_CLIENT_SECRET
- *  - GOOGLE_REFRESH_TOKEN
- *
- *  - MS_TENANT_ID
- *  - MS_CLIENT_ID
- *  - MS_CLIENT_SECRET
- *  - OUTLOOK_MAILBOX   (example: didier@turturhomeloans.com)
- *
- *  - SCAN_SECRET  (required for /scan-bounces)
+ * GOOGLE_CLIENT_ID
+ * GOOGLE_CLIENT_SECRET
+ * GOOGLE_REFRESH_TOKEN
  */
+
+const BONZO_BASE_URL = process.env.BONZO_BASE_URL || "https://platform.getbonzo.com/api/v3";
 
 // ------------------ HELPERS ------------------
 
@@ -66,11 +62,45 @@ async function readJsonOrText(r) {
 function nameLooksLikePhone(first, last) {
   const full = `${first || ""} ${last || ""}`.trim();
   if (!full) return true;
+
   const cleaned = full.replace(/[\s\-\(\)]/g, "");
   const digitCount = (cleaned.match(/\d/g) || []).length;
   if (cleaned.length > 0 && digitCount / cleaned.length > 0.7) return true;
   if (/^\d+$/.test(cleaned)) return true;
+
   return false;
+}
+
+// ------------------ BONZO API (Bearer Token) ------------------
+// Bonzo expects Authorization: Bearer <token>   [oai_citation:2‡Postman](https://www.postman.com/getbonzo/bonzo-api/request/2y91snq/show-prospect)
+
+function bonzoHeaders() {
+  const token = process.env.BONZO_API_KEY;
+  if (!token) throw new Error("Missing BONZO_API_KEY env var (Personal API access token).");
+  return {
+    Accept: "application/json",
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${token}`,
+  };
+}
+
+async function bonzoGetProspect(prospectId) {
+  const r = await fetch(`${BONZO_BASE_URL}/prospects/${prospectId}`, {
+    method: "GET",
+    headers: bonzoHeaders(),
+  });
+  const out = await readJsonOrText(r);
+  return out;
+}
+
+async function bonzoPutProspect(prospectId, prospectData) {
+  const r = await fetch(`${BONZO_BASE_URL}/prospects/${prospectId}`, {
+    method: "PUT",
+    headers: bonzoHeaders(),
+    body: JSON.stringify(prospectData),
+  });
+  const out = await readJsonOrText(r);
+  return out;
 }
 
 // ------------------ GOOGLE AUTH ------------------
@@ -90,6 +120,7 @@ async function getGoogleAccessToken() {
   });
 
   const out = await readJsonOrText(r);
+
   if (!out.ok) {
     console.error("Google token error:", out.status, out.json || out.text);
     throw new Error("Failed to refresh token");
@@ -107,7 +138,10 @@ async function searchGoogleContacts(query, accessToken) {
     "&readMask=names,emailAddresses,phoneNumbers,biographies,metadata" +
     "&pageSize=10";
 
-  const r = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+  const r = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+
   const out = await readJsonOrText(r);
 
   if (!out.ok) {
@@ -126,7 +160,10 @@ async function getPerson(resourceName, accessToken) {
     `https://people.googleapis.com/v1/${rn}` +
     "?personFields=names,emailAddresses,phoneNumbers,biographies,organizations";
 
-  const r = await fetch(url, { headers: { Authorization: `Bearer ${accessToken}` } });
+  const r = await fetch(url, {
+    headers: { Authorization: `Bearer ${accessToken}` },
+  });
+
   const out = await readJsonOrText(r);
 
   if (!out.ok) {
@@ -137,7 +174,7 @@ async function getPerson(resourceName, accessToken) {
   return out.json;
 }
 
-// ------------------ MATCHING LOGIC ------------------
+// ------------------ MATCHING LOGIC (PREVENT DUPES) ------------------
 
 function personHasEmail(person, email) {
   if (!email) return false;
@@ -196,7 +233,7 @@ async function findExistingContact(prospect, accessToken) {
   return null;
 }
 
-// ------------------ UPSERT GOOGLE CONTACT ------------------
+// ------------------ UPSERT (NO DUPES) ------------------
 
 async function upsertGoogleContact(prospect) {
   if (nameLooksLikePhone(prospect?.first_name, prospect?.last_name)) {
@@ -217,7 +254,12 @@ async function upsertGoogleContact(prospect) {
   const accessToken = await getGoogleAccessToken();
 
   const body = {
-    names: [{ givenName: prospect?.first_name || "", familyName: prospect?.last_name || "" }],
+    names: [
+      {
+        givenName: prospect?.first_name || "",
+        familyName: prospect?.last_name || "",
+      },
+    ],
     emailAddresses: email ? [{ value: email }] : [],
     phoneNumbers: [{ value: phoneStored || phoneDigits }],
     biographies: [{ value: `Source: Bonzo | ID: ${prospect?.id || ""}` }],
@@ -236,7 +278,8 @@ async function upsertGoogleContact(prospect) {
       "?updatePersonFields=names,emailAddresses,phoneNumbers,biographies,organizations";
 
     for (let attempt = 1; attempt <= 2; attempt++) {
-      const etag = attempt === 1 ? person.etag : (await getPerson(rn, accessToken)).etag;
+      const etag =
+        attempt === 1 ? person.etag : (await getPerson(rn, accessToken)).etag;
 
       const r = await fetch(updateUrl, {
         method: "PATCH",
@@ -255,7 +298,10 @@ async function upsertGoogleContact(prospect) {
         return out.json;
       }
 
-      if (out.status === 412 && attempt === 1) continue;
+      if (out.status === 412 && attempt === 1) {
+        console.warn("ETag mismatch (412). Retrying with fresh etag...");
+        continue;
+      }
 
       console.error("updateContact failed:", out.status, out.json || out.text);
       throw new Error("Failed to update contact");
@@ -283,182 +329,32 @@ async function upsertGoogleContact(prospect) {
   return out.json;
 }
 
-// ------------------ BONZO API HELPERS ------------------
+// ------------------ QUICK TEST ROUTES ------------------
 
-function bonzoBase() {
-  // IMPORTANT: default to app.getbonzo.com (matches your webhook URLs)
-  return process.env.BONZO_BASE_URL || "https://app.getbonzo.com/api";
-}
+app.get("/health", (req, res) => res.status(200).send("ok"));
 
-function bonzoHeaders() {
-  const mode = String(process.env.BONZO_AUTH_MODE || "raw").toLowerCase();
-  const key = process.env.BONZO_API_KEY || "";
-
-  // Always ask for JSON so we don't get HTML back
-  const base = {
-    "Content-Type": "application/json",
-    Accept: "application/json",
-  };
-
-  // Modes:
-  //  - bearer: Authorization: Bearer <token>
-  //  - raw:    Authorization: <token>   (NO "Bearer")
-  //  - xapikey: X-API-KEY: <token>
-  if (mode === "bearer") return { ...base, Authorization: `Bearer ${key}` };
-  if (mode === "xapikey") return { ...base, "X-API-KEY": key };
-  return { ...base, Authorization: key }; // raw (your “no Bearer” case)
-}
-
-async function bonzoFetch(path, opts = {}) {
-  const url = `${bonzoBase()}${path}`;
-  const r = await fetch(url, {
-    ...opts,
-    headers: {
-      ...bonzoHeaders(),
-      ...(opts.headers || {}),
-    },
-  });
-  return await readJsonOrText(r);
-}
-
-async function bonzoGetProspectById(id) {
-  return await bonzoFetch(`/prospects/${id}`, { method: "GET" });
-}
-
-async function bonzoPutProspectFull(id, prospectObj) {
-  return await bonzoFetch(`/prospects/${id}`, {
-    method: "PUT",
-    body: JSON.stringify(prospectObj),
-  });
-}
-
-// Best-effort search (leave this; it will start working once auth mode is right)
-async function bonzoFindProspectsByEmail(email) {
-  const e = normalizeEmail(email);
-  if (!e) return [];
-
-  const candidates = [
-    `/prospects?query=${encodeURIComponent(e)}`,
-    `/prospects?search=${encodeURIComponent(e)}`,
-    `/prospects/search?query=${encodeURIComponent(e)}`,
-  ];
-
-  for (const path of candidates) {
-    const out = await bonzoFetch(path, { method: "GET" });
-
-    if (!out.ok) {
-      console.log("Bonzo search failed:", path, out.status, out.json || out.text);
-      continue;
-    }
-
-    const data = out.json;
-    const list =
-      data?.prospects ||
-      data?.data ||
-      data?.results ||
-      (Array.isArray(data) ? data : null) ||
-      [];
-
-    if (Array.isArray(list)) return list;
+/**
+ * TEST BONZO TOKEN + BASE URL:
+ * Visit: https://<your-render-url>/debug/bonzo/prospect/98725114
+ * If auth is right you should see status 200 and the prospect payload.
+ */
+app.get("/debug/bonzo/prospect/:id", async (req, res) => {
+  try {
+    const out = await bonzoGetProspect(req.params.id);
+    return res.status(200).json(out);
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e?.message || e) });
   }
+});
 
-  return [];
-}
-
-// ------------------ MICROSOFT GRAPH AUTH ------------------
-
-async function getMsGraphToken() {
-  const tenant = process.env.MS_TENANT_ID;
-  const clientId = process.env.MS_CLIENT_ID;
-  const clientSecret = process.env.MS_CLIENT_SECRET;
-
-  if (!tenant || !clientId || !clientSecret) {
-    throw new Error("Missing MS_TENANT_ID / MS_CLIENT_ID / MS_CLIENT_SECRET");
-  }
-
-  const tokenUrl = `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
-  const params = new URLSearchParams({
-    client_id: clientId,
-    client_secret: clientSecret,
-    grant_type: "client_credentials",
-    scope: "https://graph.microsoft.com/.default",
-  });
-
-  const r = await fetch(tokenUrl, {
-    method: "POST",
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-    body: params.toString(),
-  });
-
-  const out = await readJsonOrText(r);
-  if (!out.ok) {
-    console.error("MS token error:", out.status, out.json || out.text);
-    throw new Error("Failed to get Microsoft Graph token");
-  }
-
-  return out.json.access_token;
-}
-
-async function graphGet(path, token) {
-  const url = `https://graph.microsoft.com/v1.0${path}`;
-  const r = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
-  const out = await readJsonOrText(r);
-  if (!out.ok) {
-    console.error("Graph GET failed:", url, out.status, out.json || out.text);
-    throw new Error(`Graph GET failed ${out.status}`);
-  }
-  return out.json;
-}
-
-// ------------------ BOUNCE DETECTION ------------------
-
-function extractEmailFromText(text) {
-  const t = String(text || "");
-  const m = t.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi);
-  if (!m || !m.length) return "";
-  return normalizeEmail(m[0]);
-}
-
-function isBounceSubject(subject) {
-  const s = String(subject || "").toLowerCase();
-  return (
-    s.includes("undeliverable") ||
-    s.includes("delivery has failed") ||
-    s.includes("delivery failed") ||
-    s.includes("returned mail") ||
-    s.includes("failure notice") ||
-    s.includes("mail delivery subsystem") ||
-    s.includes("delivery status notification") ||
-    s.includes("could not be delivered") ||
-    s.includes("message blocked") ||
-    s.includes("bounce")
-  );
-}
-
-// In-memory de-dupe for scanned messages (prevents repeat deletes)
-const seenMessageIds = new Map(); // id -> timestamp
-function markSeen(id) {
-  if (!id) return;
-  seenMessageIds.set(id, Date.now());
-}
-function isSeen(id) {
-  if (!id) return false;
-  return seenMessageIds.has(id);
-}
-// Clean old entries every 10 minutes (keep ~1 hour)
-setInterval(() => {
-  const cutoff = Date.now() - 60 * 60 * 1000;
-  for (const [id, ts] of seenMessageIds.entries()) {
-    if (ts < cutoff) seenMessageIds.delete(id);
-  }
-}, 10 * 60 * 1000);
-
-// ------------------ WEBHOOKS ------------------
+// ------------------ BONZO EVENT HOOK (Google Contacts sync) ------------------
 
 app.post("/bonzo/events", async (req, res) => {
   try {
     const code = req.header("x-bonzo-code");
-    if (code !== process.env.BONZO_CODE) return res.status(401).send("Unauthorized");
+    if (code !== process.env.BONZO_CODE) {
+      return res.status(401).send("Unauthorized");
+    }
 
     const { event, prospect } = req.body;
     console.log("Bonzo event:", event);
@@ -467,18 +363,21 @@ app.post("/bonzo/events", async (req, res) => {
       await upsertGoogleContact(prospect);
     }
 
-    res.status(200).json({ ok: true });
+    return res.status(200).json({ ok: true });
   } catch (err) {
     console.error("Webhook error:", err);
-    res.status(500).send("Server error");
+    return res.status(500).send("Server error");
   }
 });
 
-// Cleanup webhook: bad phone / bad email (Bonzo event hook)
+// ------------------ BONZO EVENT HOOK (Cleanup bad email/phone) ------------------
+
 app.post("/bonzo/event-hook", async (req, res) => {
   try {
     const code = req.header("x-bonzo-code");
-    if (code !== process.env.BONZO_CODE) return res.status(401).send("Unauthorized");
+    if (code !== process.env.BONZO_CODE) {
+      return res.status(401).send("Unauthorized");
+    }
 
     const { event, additional, prospect } = req.body;
 
@@ -487,153 +386,78 @@ app.post("/bonzo/event-hook", async (req, res) => {
     }
 
     const message = additional?.message;
-    if (!message) return res.status(200).json({ ok: true, ignored: true, reason: "no_message" });
+    if (!message) {
+      return res.status(200).json({ ok: true, ignored: true, reason: "no_message" });
+    }
 
     const status = String(message.status || "").toLowerCase();
     const type = String(message.type || "").toLowerCase();
-    const prospectId = message?.prospect?.id || prospect?.id || message?.prospect_id;
+
+    const prospectId =
+      message?.prospect?.id ||
+      prospect?.id ||
+      message?.prospect_id;
 
     console.log("Message update:", { status, type, prospectId, messageId: message.id });
 
     const BAD_STATUSES = new Set(["failed", "bounced", "undeliverable", "error"]);
-    if (!prospectId) return res.status(200).json({ ok: true, skipped: true, reason: "no_prospect_id" });
-    if (!BAD_STATUSES.has(status)) return res.status(200).json({ ok: true, skipped: true, reason: "status_not_bad" });
-    if (type !== "sms" && type !== "email") return res.status(200).json({ ok: true, skipped: true, reason: "type_not_sms_or_email" });
 
-    const getOut = await bonzoGetProspectById(prospectId);
-
-    // If you ever see HTML here, auth/base URL is wrong
-    if (!getOut.ok || !getOut.json) {
-      console.log("Cleanup skipped: could not GET prospect", getOut.status, getOut.json || getOut.text);
-      return res.status(200).json({ ok: true, skipped: true, reason: "get_failed" });
+    if (!prospectId) {
+      return res.status(200).json({ ok: true, skipped: true, reason: "no_prospect_id" });
     }
 
-    const current = getOut.json;
+    if (!BAD_STATUSES.has(status)) {
+      return res.status(200).json({ ok: true, skipped: true, reason: "status_not_bad" });
+    }
+
+    if (type !== "sms" && type !== "email") {
+      return res.status(200).json({ ok: true, skipped: true, reason: "type_not_sms_or_email" });
+    }
+
+    // 1) GET prospect (Bonzo returns { data: {...} })  [oai_citation:3‡Postman](https://www.postman.com/getbonzo/bonzo-api/request/2y91snq/show-prospect)
+    const getOut = await bonzoGetProspect(prospectId);
+
+    if (!getOut.ok) {
+      console.log("Cleanup skipped: could not GET prospect", getOut.status, getOut.json || getOut.text);
+      return res.status(200).json({ ok: true, skipped: true, reason: "get_failed", status: getOut.status });
+    }
+
+    const current = getOut.json?.data || getOut.json; // support either shape
+
+    // 2) Modify
+    const updated = { ...current };
+    const tags = Array.isArray(updated.tags) ? updated.tags : [];
+    const tagSet = new Set(tags);
 
     if (type === "sms") {
-      current.phone = null;
-      current.tags = Array.from(new Set([...(current.tags || []), "bad_phone"]));
+      updated.phone = null;
+      tagSet.add("bad_phone");
     } else {
-      current.email = null;
-      current.tags = Array.from(new Set([...(current.tags || []), "bad_email"]));
+      updated.email = null;
+      tagSet.add("bad_email");
     }
 
-    const putOut = await bonzoPutProspectFull(prospectId, current);
+    updated.tags = Array.from(tagSet);
+
+    // 3) PUT updated prospect
+    const putOut = await bonzoPutProspect(prospectId, updated);
+
     console.log("Cleanup result:", putOut.status, putOut.json || putOut.text);
 
-    return res.status(200).json({ ok: true, cleaned: putOut.ok, status: putOut.status });
+    return res.status(200).json({
+      ok: true,
+      cleaned: putOut.ok,
+      putStatus: putOut.status,
+    });
   } catch (err) {
     console.error("Cleanup error:", err);
     return res.status(200).json({ ok: false, error: "exception" });
   }
 });
 
-// ------------------ OUTLOOK TEST + BOUNCE SCAN ------------------
-
-app.get("/test-outlook", async (req, res) => {
-  try {
-    const mailbox = process.env.OUTLOOK_MAILBOX;
-    if (!mailbox) return res.status(500).json({ ok: false, error: "Missing OUTLOOK_MAILBOX env var" });
-
-    const token = await getMsGraphToken();
-
-    const data = await graphGet(
-      `/users/${encodeURIComponent(mailbox)}/mailFolders/Inbox/messages?$top=5&$select=id,subject,receivedDateTime,from,bodyPreview`,
-      token
-    );
-
-    const messages = (data?.value || []).map((m) => ({
-      id: m.id,
-      subject: m.subject,
-      receivedDateTime: m.receivedDateTime,
-      from: m.from?.emailAddress?.address || "",
-      preview: (m.bodyPreview || "").slice(0, 140),
-    }));
-
-    return res.json({ ok: true, mailbox, count: messages.length, messages });
-  } catch (e) {
-    console.error("test-outlook error:", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
-
-app.post("/scan-bounces", async (req, res) => {
-  const secret = req.header("x-scan-secret");
-  if (!process.env.SCAN_SECRET) return res.status(500).send("Missing SCAN_SECRET on server");
-  if (secret !== process.env.SCAN_SECRET) return res.status(401).send("Unauthorized");
-
-  try {
-    const mailbox = process.env.OUTLOOK_MAILBOX;
-    if (!mailbox) return res.status(500).json({ ok: false, error: "Missing OUTLOOK_MAILBOX env var" });
-
-    const top = Math.min(Math.max(Number(req.body?.top || 25), 1), 100);
-    const token = await getMsGraphToken();
-
-    const data = await graphGet(
-      `/users/${encodeURIComponent(mailbox)}/mailFolders/Inbox/messages?$top=${top}&$select=id,subject,receivedDateTime,from,bodyPreview`,
-      token
-    );
-
-    const items = data?.value || [];
-    const bounces = [];
-
-    for (const m of items) {
-      if (isSeen(m.id)) continue;
-      markSeen(m.id);
-
-      if (!isBounceSubject(m.subject)) continue;
-
-      const email = extractEmailFromText(m.bodyPreview) || extractEmailFromText(m.subject);
-
-      if (!email) {
-        bounces.push({ id: m.id, subject: m.subject, extractedEmail: "", action: "no_email_found" });
-        continue;
-      }
-
-      const prospects = await bonzoFindProspectsByEmail(email);
-
-      if (!prospects.length) {
-        bounces.push({ id: m.id, subject: m.subject, extractedEmail: email, action: "no_bonzo_match_found" });
-        continue;
-      }
-
-      let cleanedCount = 0;
-      for (const p of prospects) {
-        const pid = p?.id || p?.prospectId || p?.prospect_id;
-        if (!pid) continue;
-
-        const getOut = await bonzoGetProspectById(pid);
-        if (!getOut.ok || !getOut.json) continue;
-
-        const current = getOut.json;
-        current.email = null;
-        current.tags = Array.from(new Set([...(current.tags || []), "bad_email"]));
-
-        const putOut = await bonzoPutProspectFull(pid, current);
-        if (putOut.ok) cleanedCount++;
-      }
-
-      bounces.push({
-        id: m.id,
-        subject: m.subject,
-        extractedEmail: email,
-        action: "clean_attempted",
-        bonzoMatches: prospects.length,
-        cleanedCount,
-      });
-    }
-
-    return res.json({ ok: true, scanned: items.length, bouncesFound: bounces.length, bounces });
-  } catch (e) {
-    console.error("scan-bounces error:", e);
-    return res.status(500).json({ ok: false, error: String(e?.message || e) });
-  }
-});
-
 // ------------------ START SERVER ------------------
-
-app.get("/", (req, res) => res.status(200).send("ok"));
 
 app.listen(process.env.PORT || 3000, () => {
   console.log("Server running");
+  console.log("Using BONZO_BASE_URL:", BONZO_BASE_URL);
 });
