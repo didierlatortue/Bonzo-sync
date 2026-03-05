@@ -2,7 +2,7 @@ name: Scan Outlook Bounces
 
 on:
   schedule:
-    - cron: "*/1 * * * *"   # every 1 minute
+    - cron: "*/5 * * * *"   # every 1 minute
   workflow_dispatch:
 
 jobs:
