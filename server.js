@@ -465,10 +465,10 @@ async function upsertGoogleContact(prospect) {
 }
 
 // =========================
-// GOOGLE DELETE (NEW)
-// Delete Google contact(s) that were created for a Bonzo prospect ID.
+// GOOGLE DELETE (FIXED)
+// Delete Google contact(s) created for a Bonzo prospect ID.
 // Safety: Only deletes contacts whose biography contains "Source: Bonzo | ID: <id>".
-// Best-effort: never throws up to the webhook caller.
+// Now searches by: bonzoId + email + phone + digits + last10 (because bio search isn't reliable).
 // =========================
 function personHasBonzoId(person, bonzoId) {
   const needle = "Source: Bonzo | ID: " + String(bonzoId || "").trim();
@@ -485,32 +485,61 @@ async function deleteGoogleContact(resourceName, accessToken) {
   return true;
 }
 
-async function deleteGoogleContactsForBonzoProspectId(bonzoId) {
+function buildGoogleDeleteQueries(bonzoId, email, phone) {
   const id = String(bonzoId || "").trim();
-  if (!id) return { ok: false, reason: "no_id", deleted: 0, checked: 0 };
+  const e = normalizeEmail(email);
+  const pStored = normalizePhoneForStore(phone);
+  const pDigits = digitsOnly(pStored);
+  const pLast10 = last10Digits(pDigits);
+
+  const queries = [];
+  if (id) queries.push(id);
+  if (e) queries.push(e);
+
+  if (pStored) queries.push(pStored);
+  if (pDigits) queries.push(pDigits);
+  if (pLast10 && pLast10.length === 10) queries.push(pLast10);
+
+  return Array.from(new Set(queries)).filter(Boolean);
+}
+
+async function deleteGoogleContactsForBonzoProspect(bonzoId, email, phone) {
+  const id = String(bonzoId || "").trim();
+  if (!id) return { ok: false, reason: "no_id", deleted: 0, checked: 0, searched: 0, queries: [] };
 
   const accessToken = await getGoogleAccessToken();
+  const queries = buildGoogleDeleteQueries(id, email, phone);
 
-  // Search by ID, then verify biography match before delete.
-  const people = await searchGoogleContacts(id, accessToken);
-  if (!people.length) return { ok: true, deleted: 0, checked: 0 };
+  let candidates = [];
+  for (const q of queries) {
+    const people = await searchGoogleContacts(q, accessToken);
+    candidates = candidates.concat(people || []);
+  }
+
+  // de-dupe by resourceName
+  const byRn = new Map();
+  for (const p of candidates) {
+    if (p && p.resourceName) byRn.set(p.resourceName, p);
+  }
+  const uniqCandidates = Array.from(byRn.values());
 
   let deleted = 0;
   let checked = 0;
 
-  for (const p of people) {
+  for (const p of uniqCandidates) {
     if (!p || !p.resourceName) continue;
 
     const full = await getPerson(p.resourceName, accessToken);
     checked++;
 
+    // absolute safety: only delete if our Bonzo ID marker is present in biography
     if (!personHasBonzoId(full, id)) continue;
 
     await deleteGoogleContact(full.resourceName, accessToken);
     deleted++;
   }
 
-  return { ok: true, deleted, checked };
+  return { ok: true, deleted, checked, searched: uniqCandidates.length, queries };
 }
 
 // =========================
@@ -600,7 +629,7 @@ app.post("/bonzo/events", async (req, res) => {
  * Phone cleanup via Bonzo message status (SMS only)
  * Fix: PATCH-only updates so we never wipe email/tags accidentally.
  *
- * NEW: If phone is deleted successfully, also delete the Google contact we created (by Bonzo ID in biography).
+ * Also deletes the Google contact we created (by matching biography "Source: Bonzo | ID: <id>").
  */
 app.post("/bonzo/event-hook", async (req, res) => {
   try {
@@ -632,6 +661,11 @@ app.post("/bonzo/event-hook", async (req, res) => {
     }
 
     const current = getOut.json;
+
+    // Capture BEFORE clearing (so Google search has email/phone)
+    const emailBefore = normalizeEmail(current && current.email);
+    const phoneBefore = normalizePhoneForStore(current && current.phone);
+
     const currentTags = getTagNames(current.tags);
     const nextTags = addTags(currentTags, ["bad_phone"]); // ✅ always union
 
@@ -645,7 +679,7 @@ app.post("/bonzo/event-hook", async (req, res) => {
     // Best-effort Google delete (never break webhook)
     if (updOut && updOut.ok) {
       try {
-        const del = await deleteGoogleContactsForBonzoProspectId(prospectId);
+        const del = await deleteGoogleContactsForBonzoProspect(prospectId, emailBefore, phoneBefore);
         console.log("[googleDelete] result:", del);
       } catch (e) {
         console.log("[googleDelete] skipped/error:", String((e && e.message) || e));
