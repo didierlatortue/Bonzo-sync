@@ -465,6 +465,55 @@ async function upsertGoogleContact(prospect) {
 }
 
 // =========================
+// GOOGLE DELETE (NEW)
+// Delete Google contact(s) that were created for a Bonzo prospect ID.
+// Safety: Only deletes contacts whose biography contains "Source: Bonzo | ID: <id>".
+// Best-effort: never throws up to the webhook caller.
+// =========================
+function personHasBonzoId(person, bonzoId) {
+  const needle = "Source: Bonzo | ID: " + String(bonzoId || "").trim();
+  const bios = (person && person.biographies) || [];
+  return bios.some((b) => String(b && b.value).includes(needle));
+}
+
+async function deleteGoogleContact(resourceName, accessToken) {
+  const rn = ensurePeopleResourceName(resourceName);
+  const url = "https://people.googleapis.com/v1/" + rn + ":deleteContact";
+  const r = await fetch(url, { method: "DELETE", headers: { Authorization: "Bearer " + accessToken } });
+  const out = await readJsonOrText(r);
+  if (!out.ok) throw new Error("deleteContact failed: " + out.status);
+  return true;
+}
+
+async function deleteGoogleContactsForBonzoProspectId(bonzoId) {
+  const id = String(bonzoId || "").trim();
+  if (!id) return { ok: false, reason: "no_id", deleted: 0, checked: 0 };
+
+  const accessToken = await getGoogleAccessToken();
+
+  // Search by ID, then verify biography match before delete.
+  const people = await searchGoogleContacts(id, accessToken);
+  if (!people.length) return { ok: true, deleted: 0, checked: 0 };
+
+  let deleted = 0;
+  let checked = 0;
+
+  for (const p of people) {
+    if (!p || !p.resourceName) continue;
+
+    const full = await getPerson(p.resourceName, accessToken);
+    checked++;
+
+    if (!personHasBonzoId(full, id)) continue;
+
+    await deleteGoogleContact(full.resourceName, accessToken);
+    deleted++;
+  }
+
+  return { ok: true, deleted, checked };
+}
+
+// =========================
 // MICROSOFT GRAPH
 // =========================
 async function getMsGraphToken() {
@@ -550,6 +599,8 @@ app.post("/bonzo/events", async (req, res) => {
 /**
  * Phone cleanup via Bonzo message status (SMS only)
  * Fix: PATCH-only updates so we never wipe email/tags accidentally.
+ *
+ * NEW: If phone is deleted successfully, also delete the Google contact we created (by Bonzo ID in biography).
  */
 app.post("/bonzo/event-hook", async (req, res) => {
   try {
@@ -590,6 +641,16 @@ app.post("/bonzo/event-hook", async (req, res) => {
       phone_type: "invalid",
       tags: nextTags,
     });
+
+    // Best-effort Google delete (never break webhook)
+    if (updOut && updOut.ok) {
+      try {
+        const del = await deleteGoogleContactsForBonzoProspectId(prospectId);
+        console.log("[googleDelete] result:", del);
+      } catch (e) {
+        console.log("[googleDelete] skipped/error:", String((e && e.message) || e));
+      }
+    }
 
     console.log("Cleanup result:", updOut.status, updOut.json || updOut.text);
     return res.status(200).json({ ok: true, cleaned: updOut.ok, status: updOut.status });
