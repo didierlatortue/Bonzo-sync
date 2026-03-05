@@ -470,6 +470,31 @@ app.post("/scan-bounces", async (req, res) => {
   }
 });
 
+// TEMP: verify Bonzo auth/header style from a browser
+app.get("/debug-bonzo-auth", async (req, res) => {
+  const secret = req.header("x-scan-secret");
+  if (secret !== process.env.SCAN_SECRET) return res.status(401).send("Unauthorized");
+
+  const id = req.query.id || "98725114";
+  const key = String(process.env.BONZO_API_KEY || "").trim();
+  const baseUrl = String(process.env.BONZO_BASE_URL || "https://platform.getbonzo.com/api").replace(/\/+$/, "");
+  const url = baseUrl + "/prospects/" + encodeURIComponent(id);
+
+  async function tryReq(label, headers) {
+    const r = await fetch(url, { method: "GET", headers });
+    const out = await readJsonOrText(r);
+    return { label, status: out.status, ok: out.ok, body: out.json || out.text || null };
+  }
+
+  const tests = [];
+  tests.push(await tryReq("bearer", { Accept: "application/json", Authorization: "Bearer " + key }));
+  tests.push(await tryReq("x-api-key", { Accept: "application/json", "X-API-KEY": key }));
+  // Sometimes vendors use lowercase
+  tests.push(await tryReq("x-api-key-lower", { Accept: "application/json", "x-api-key": key }));
+
+  res.json({ baseUrl, url, keyLen: key.length, keyStartsWith: key.slice(0, 3), results: tests });
+});
+
 app.get("/", (req, res) => res.status(200).send("ok"));
 app.listen(process.env.PORT || 3000, () => {
   console.log("Server running");
