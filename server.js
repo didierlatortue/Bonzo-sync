@@ -957,7 +957,12 @@ async function sha256Lower(s) {
 //   }
 app.post("/meta/capi", async (req, res) => {
   try {
-    if (req.header("x-meta-code") !== process.env.LEAD_INBOUND_CODE) {
+    // Cowork: accept either x-meta-code header OR Origin in allowlist (for /thanks page server-side fire)
+    const _capiOrigin = (req.headers.origin || "").toLowerCase();
+    const _capiAllowed = ["https://turturhomeloans.com", "https://www.turturhomeloans.com"];
+    const _capiCodeOk = req.header("x-meta-code") === process.env.LEAD_INBOUND_CODE;
+    const _capiOriginOk = _capiAllowed.indexOf(_capiOrigin) !== -1;
+    if (!_capiCodeOk && !_capiOriginOk) {
       return res.status(401).send("Unauthorized");
     }
     const b = req.body || {};
