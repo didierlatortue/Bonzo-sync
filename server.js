@@ -1082,21 +1082,28 @@ async function _coworkHandleInbound(req, res) {
     };
 
     // Look up existing prospect by email or phone to decide create-vs-update
+    // Bonzo only honors `?search=` for filtering (other params return all prospects).
+    // Search returns matches across multiple fields, so we re-verify the email/phone match.
+    function _norm(s) { return (s || "").toString().trim().toLowerCase(); }
+    function _normPhone(s) {
+      return (s || "").toString().replace(/[^0-9]/g, "").replace(/^1(\d{10})$/, "$1");
+    }
     let existing = null;
-    if (email) {
-      const r = await fetch(`${bonzoBase}/prospects?email=${encodeURIComponent(email)}&per_page=1`, { headers });
-      if (r.ok) {
-        const j = await r.json();
-        if (Array.isArray(j.data) && j.data.length) existing = j.data[0];
+    async function _findBy(searchTerm, kind) {
+      const r = await fetch(`${bonzoBase}/prospects?search=${encodeURIComponent(searchTerm)}&per_page=10`, { headers });
+      if (!r.ok) return null;
+      const j = await r.json();
+      const data = Array.isArray(j.data) ? j.data : [];
+      const want = _norm(searchTerm);
+      const wantPhone = _normPhone(searchTerm);
+      for (const p of data) {
+        if (kind === "email" && _norm(p.email) === want) return p;
+        if (kind === "phone" && _normPhone(p.phone) === wantPhone) return p;
       }
+      return null;
     }
-    if (!existing && phone) {
-      const r = await fetch(`${bonzoBase}/prospects?phone=${encodeURIComponent(phone)}&per_page=1`, { headers });
-      if (r.ok) {
-        const j = await r.json();
-        if (Array.isArray(j.data) && j.data.length) existing = j.data[0];
-      }
-    }
+    if (email) existing = await _findBy(email, "email");
+    if (!existing && phone) existing = await _findBy(phone, "phone");
 
     // Build prospect payload (top-level fields keyed by label_normalized — what Bonzo's API accepts)
     const prospectPayload = {
