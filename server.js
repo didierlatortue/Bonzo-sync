@@ -3,6 +3,7 @@ import fetch from "node-fetch";
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
+app.use(express.urlencoded({ extended: true }));
 
 // =========================
 // HELPERS
@@ -1068,14 +1069,14 @@ async function _coworkHandleInbound(req, res) {
     // Look up existing prospect by email or phone to decide create-vs-update
     let existing = null;
     if (email) {
-      const r = await fetch(`${bonzoBase}/v3/prospects?email=${encodeURIComponent(email)}&per_page=1`, { headers });
+      const r = await fetch(`${bonzoBase}/prospects?email=${encodeURIComponent(email)}&per_page=1`, { headers });
       if (r.ok) {
         const j = await r.json();
         if (Array.isArray(j.data) && j.data.length) existing = j.data[0];
       }
     }
     if (!existing && phone) {
-      const r = await fetch(`${bonzoBase}/v3/prospects?phone=${encodeURIComponent(phone)}&per_page=1`, { headers });
+      const r = await fetch(`${bonzoBase}/prospects?phone=${encodeURIComponent(phone)}&per_page=1`, { headers });
       if (r.ok) {
         const j = await r.json();
         if (Array.isArray(j.data) && j.data.length) existing = j.data[0];
@@ -1102,7 +1103,7 @@ async function _coworkHandleInbound(req, res) {
     if (existing) {
       prospectId = existing.id;
       action = "updated";
-      const r = await fetch(`${bonzoBase}/v3/prospects/${prospectId}`, {
+      const r = await fetch(`${bonzoBase}/prospects/${prospectId}`, {
         method: "PUT",
         headers,
         body: JSON.stringify(prospectPayload),
@@ -1112,7 +1113,7 @@ async function _coworkHandleInbound(req, res) {
         console.error("PUT prospect failed", r.status, t.slice(0, 500));
       }
     } else {
-      const r = await fetch(`${bonzoBase}/v3/prospects`, {
+      const r = await fetch(`${bonzoBase}/prospects`, {
         method: "POST",
         headers,
         body: JSON.stringify(prospectPayload),
@@ -1132,7 +1133,7 @@ async function _coworkHandleInbound(req, res) {
     if (prospectId) {
       try {
         const noteBody = "Cowork attribution capture:\n" + JSON.stringify(attr, null, 2);
-        await fetch(`${bonzoBase}/v3/prospects/${prospectId}/notes`, {
+        await fetch(`${bonzoBase}/prospects/${prospectId}/notes`, {
           method: "POST",
           headers,
           body: JSON.stringify({ note: noteBody }),
@@ -1154,13 +1155,13 @@ async function _coworkHandleInbound(req, res) {
 }
 
 // Legacy endpoint with header auth (kept for backward compat)
-app.post("/lead/inbound", express.urlencoded({ extended: true }), express.json(), (req, res) => {
+app.post("/lead/inbound", (req, res) => {
   if (req.header("x-lead-code") !== process.env.LEAD_INBOUND_CODE) return res.status(401).send("Unauthorized");
   return _coworkHandleInbound(req, res);
 });
 
 // New path-based variant: Elementor can call this without custom headers
-app.post("/lead/inbound/:code", express.urlencoded({ extended: true }), express.json(), (req, res) => {
+app.post("/lead/inbound/:code", (req, res) => {
   if (req.params.code !== process.env.LEAD_INBOUND_CODE) return res.status(401).send("Unauthorized");
   return _coworkHandleInbound(req, res);
 });
