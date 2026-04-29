@@ -2,6 +2,25 @@ import express from "express";
 import fetch from "node-fetch";
 
 const app = express();
+// Cowork: CORS for /meta/capi from turturhomeloans.com (server-side Meta event from /thanks)
+app.use(function (req, res, next) {
+  if (req.path === "/meta/capi") {
+    var origin = req.headers.origin || "";
+    var allow = [
+      "https://turturhomeloans.com",
+      "https://www.turturhomeloans.com"
+    ];
+    if (allow.indexOf(origin) !== -1) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+      res.setHeader("Access-Control-Max-Age", "600");
+    }
+    if (req.method === "OPTIONS") return res.status(204).end();
+  }
+  next();
+});
+
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: true }));
 
