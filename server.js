@@ -1383,9 +1383,9 @@ app.post("/google-ads/upload-conversion", express.json(), function(req, res) {
 const _PCM_DISK = "/tmp/past_clients.json";
 let _pcmCache = null;
 
+const _coworkCrypto = require("crypto");
 function _coworkSha256Hex(s) {
-  // Reuse existing helper if present, else compute
-  return require("crypto").createHash("sha256").update(String(s||"").toLowerCase().trim()).digest("hex");
+  return _coworkCrypto.createHash("sha256").update(String(s||"").toLowerCase().trim()).digest("hex");
 }
 
 function _coworkPCMLoad() {
