@@ -886,6 +886,210 @@ app.get("/ping", (req, res) => {
   });
 });
 
+
+
+// =========================================================
+// ATTRIBUTION + ARIVE-READY ENDPOINTS (added by Cowork)
+// =========================================================
+
+// Helper: hash for Meta CAPI (SHA-256 of normalized email/phone)
+async function sha256Lower(s) {
+  if (!s) return "";
+  const data = new TextEncoder().encode(String(s).trim().toLowerCase());
+  const hash = await (globalThis.crypto?.subtle?.digest("SHA-256", data));
+  if (!hash) {
+    // Fallback to Node's crypto module if Web Crypto unavailable
+    const c = require("crypto");
+    return c.createHash("sha256").update(String(s).trim().toLowerCase()).digest("hex");
+  }
+  return Array.from(new Uint8Array(hash)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// POST /lead/inbound — generic inbound webhook receiver for any lead source
+// (ARIVE, Morty, WordPress forms, manual). Stores attribution in Bonzo.
+//
+// Auth: x-lead-code header must match LEAD_INBOUND_CODE env var.
+//
+// Body shape:
+//   {
+//     first_name, last_name, email, phone,
+//     source, lead_source, lead_id,        // who sent + their identifier
+//     gclid, fbclid, gbraid, wbraid,       // click IDs
+//     utm_source, utm_medium, utm_campaign,
+//     utm_term, utm_content,
+//     page_url, page_referrer,             // landing page context
+//     loan_amount, loan_purpose,           // mortgage-specific
+//     value                                 // expected $ value (optional)
+//   }
+app.post("/lead/inbound", async (req, res) => {
+  try {
+    if (req.header("x-lead-code") !== process.env.LEAD_INBOUND_CODE) {
+      return res.status(401).send("Unauthorized");
+    }
+    const b = req.body || {};
+    if (!b.email && !b.phone) {
+      return res.status(400).json({ ok: false, error: "email or phone required" });
+    }
+
+    // Build human-readable lead_source string
+    const src = [];
+    if (b.utm_source) src.push(b.utm_source);
+    if (b.utm_medium) src.push(b.utm_medium);
+    if (b.utm_campaign) src.push(b.utm_campaign);
+    if (b.gclid) src.push("gclid:" + String(b.gclid).slice(0, 24));
+    if (b.fbclid) src.push("fbclid:" + String(b.fbclid).slice(0, 24));
+    const leadSource = src.join(" / ") || (b.source || b.lead_source || null);
+
+    // Build attribution tags (so they're searchable in Bonzo)
+    const tags = [];
+    if (b.gclid) tags.push("google ads");
+    if (b.fbclid) tags.push("meta");
+    if (b.utm_source) tags.push("source:" + String(b.utm_source).slice(0, 30));
+    if (b.utm_campaign) tags.push("campaign:" + String(b.utm_campaign).slice(0, 30));
+
+    // Look for existing prospect by email
+    let prospectId = null;
+    if (b.email) {
+      const existing = await bonzoResolveExactProspectsByEmail(b.email,
+        { maxCandidates: 5, maxDetailChecks: 3 });
+      if (existing.length > 0) prospectId = existing[0].id || existing[0].prospectId;
+    }
+
+    // Build attribution text for the notes field (since custom fields may not exist yet)
+    const attribJson = {
+      gclid: b.gclid || null, fbclid: b.fbclid || null,
+      utm_source: b.utm_source || null, utm_medium: b.utm_medium || null,
+      utm_campaign: b.utm_campaign || null, utm_term: b.utm_term || null,
+      utm_content: b.utm_content || null, page_url: b.page_url || null,
+      page_referrer: b.page_referrer || null,
+      received_at: new Date().toISOString(),
+    };
+    const attribText = "Cowork attribution: " + JSON.stringify(attribJson);
+
+    const payload = {
+      first_name: b.first_name || "",
+      last_name: b.last_name || "",
+      email: normalizeEmail(b.email),
+      phone: normalizePhoneForStore(b.phone),
+      tags: uniqTags(tags),
+      mortgage: leadSource ? { lead_source: leadSource } : undefined,
+    };
+
+    let result;
+    if (prospectId) {
+      result = await bonzoUpdateProspect(prospectId, payload);
+      console.log("[lead/inbound] updated existing prospect", prospectId);
+    } else {
+      result = await bonzoFetch("/prospects", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      console.log("[lead/inbound] created new prospect");
+    }
+
+    if (result && result.ok) {
+      const newId = prospectId || (result.json && (result.json.id || result.json.data?.id));
+      // Add attribution as a note for safekeeping (post-prospect)
+      if (newId) {
+        try {
+          await bonzoFetch(`/prospects/${newId}/notes`, {
+            method: "POST",
+            body: JSON.stringify({ note: attribText }),
+          });
+        } catch (e) { /* notes endpoint may not be available — non-fatal */ }
+      }
+      return res.status(200).json({
+        ok: true, prospect_id: newId, action: prospectId ? "updated" : "created",
+        attribution: attribJson,
+      });
+    } else {
+      return res.status(500).json({
+        ok: false, error: "bonzo_error", status: result && result.status,
+        body: result && (result.json || result.text),
+      });
+    }
+  } catch (err) {
+    console.error("[lead/inbound] error:", err);
+    return res.status(500).json({ ok: false, error: String(err.message || err) });
+  }
+});
+
+// POST /meta/capi — server-side Meta Conversions API event sender.
+// Sends a Lead/Purchase/CompleteRegistration event to your Meta Pixel,
+// using hashed email/phone for matching, with optional click_id/fbp/fbc.
+//
+// Auth: x-meta-code header must match LEAD_INBOUND_CODE env var.
+//
+// Body shape:
+//   {
+//     event_name: "Lead" | "Purchase" | "CompleteRegistration",
+//     email, phone, first_name, last_name,
+//     fbclid, client_ip, client_user_agent,
+//     event_source_url, value, currency,
+//     custom_data: { ... }
+//   }
+app.post("/meta/capi", async (req, res) => {
+  try {
+    if (req.header("x-meta-code") !== process.env.LEAD_INBOUND_CODE) {
+      return res.status(401).send("Unauthorized");
+    }
+    const b = req.body || {};
+    const eventName = b.event_name || "Lead";
+
+    if (!process.env.META_PIXEL_ID || !process.env.META_ACCESS_TOKEN) {
+      return res.status(500).json({ ok: false, error: "META_PIXEL_ID or META_ACCESS_TOKEN not configured" });
+    }
+
+    const userData = {};
+    if (b.email) userData.em = [await sha256Lower(b.email)];
+    if (b.phone) {
+      const ph = String(b.phone).replace(/\D/g, "");
+      if (ph) userData.ph = [await sha256Lower(ph)];
+    }
+    if (b.first_name) userData.fn = [await sha256Lower(b.first_name)];
+    if (b.last_name) userData.ln = [await sha256Lower(b.last_name)];
+    if (b.client_ip) userData.client_ip_address = b.client_ip;
+    if (b.client_user_agent) userData.client_user_agent = b.client_user_agent;
+    if (b.fbclid) userData.fbc = `fb.1.${Date.now()}.${b.fbclid}`;
+
+    const evt = {
+      event_name: eventName,
+      event_time: Math.floor(Date.now() / 1000),
+      action_source: "website",
+      user_data: userData,
+    };
+    if (b.event_source_url) evt.event_source_url = b.event_source_url;
+    if (b.value || b.currency) {
+      evt.custom_data = Object.assign({},
+        b.custom_data || {},
+        b.value !== undefined ? { value: Number(b.value) } : {},
+        b.currency ? { currency: b.currency } : {},
+      );
+    } else if (b.custom_data) {
+      evt.custom_data = b.custom_data;
+    }
+
+    const url = `https://graph.facebook.com/v22.0/${process.env.META_PIXEL_ID}/events?access_token=${encodeURIComponent(process.env.META_ACCESS_TOKEN)}`;
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ data: [evt] }),
+    });
+    const out = await readJsonOrText(r);
+    if (!out.ok) {
+      console.log("[meta/capi] FAILED:", out.status, out.json || out.text);
+      return res.status(500).json({ ok: false, status: out.status, body: out.json || out.text });
+    }
+    console.log("[meta/capi] sent", eventName, "events_received:", out.json?.events_received);
+    return res.status(200).json({ ok: true, response: out.json });
+  } catch (err) {
+    console.error("[meta/capi] error:", err);
+    return res.status(500).json({ ok: false, error: String(err.message || err) });
+  }
+});
+
+// =========================================================
+
 app.listen(process.env.PORT || 3000, () => {
   console.log("Server running");
 });
