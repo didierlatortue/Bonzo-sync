@@ -921,99 +921,6 @@ async function sha256Lower(s) {
 //     loan_amount, loan_purpose,           // mortgage-specific
 //     value                                 // expected $ value (optional)
 //   }
-app.post("/lead/inbound", async (req, res) => {
-  try {
-    if (req.header("x-lead-code") !== process.env.LEAD_INBOUND_CODE) {
-      return res.status(401).send("Unauthorized");
-    }
-    const b = req.body || {};
-    if (!b.email && !b.phone) {
-      return res.status(400).json({ ok: false, error: "email or phone required" });
-    }
-
-    // Build human-readable lead_source string
-    const src = [];
-    if (b.utm_source) src.push(b.utm_source);
-    if (b.utm_medium) src.push(b.utm_medium);
-    if (b.utm_campaign) src.push(b.utm_campaign);
-    if (b.gclid) src.push("gclid:" + String(b.gclid).slice(0, 24));
-    if (b.fbclid) src.push("fbclid:" + String(b.fbclid).slice(0, 24));
-    const leadSource = src.join(" / ") || (b.source || b.lead_source || null);
-
-    // Build attribution tags (so they're searchable in Bonzo)
-    const tags = [];
-    if (b.gclid) tags.push("google ads");
-    if (b.fbclid) tags.push("meta");
-    if (b.utm_source) tags.push("source:" + String(b.utm_source).slice(0, 30));
-    if (b.utm_campaign) tags.push("campaign:" + String(b.utm_campaign).slice(0, 30));
-
-    // Look for existing prospect by email
-    let prospectId = null;
-    if (b.email) {
-      const existing = await bonzoResolveExactProspectsByEmail(b.email,
-        { maxCandidates: 5, maxDetailChecks: 3 });
-      if (existing.length > 0) prospectId = existing[0].id || existing[0].prospectId;
-    }
-
-    // Build attribution text for the notes field (since custom fields may not exist yet)
-    const attribJson = {
-      gclid: b.gclid || null, fbclid: b.fbclid || null,
-      utm_source: b.utm_source || null, utm_medium: b.utm_medium || null,
-      utm_campaign: b.utm_campaign || null, utm_term: b.utm_term || null,
-      utm_content: b.utm_content || null, page_url: b.page_url || null,
-      page_referrer: b.page_referrer || null,
-      received_at: new Date().toISOString(),
-    };
-    const attribText = "Cowork attribution: " + JSON.stringify(attribJson);
-
-    const payload = {
-      first_name: b.first_name || "",
-      last_name: b.last_name || "",
-      email: normalizeEmail(b.email),
-      phone: normalizePhoneForStore(b.phone),
-      tags: uniqTags(tags),
-      mortgage: leadSource ? { lead_source: leadSource } : undefined,
-    };
-
-    let result;
-    if (prospectId) {
-      result = await bonzoUpdateProspect(prospectId, payload);
-      console.log("[lead/inbound] updated existing prospect", prospectId);
-    } else {
-      result = await bonzoFetch("/prospects", {
-        method: "POST",
-        body: JSON.stringify(payload),
-      });
-      console.log("[lead/inbound] created new prospect");
-    }
-
-    if (result && result.ok) {
-      const newId = prospectId || (result.json && (result.json.id || result.json.data?.id));
-      // Add attribution as a note for safekeeping (post-prospect)
-      if (newId) {
-        try {
-          await bonzoFetch(`/prospects/${newId}/notes`, {
-            method: "POST",
-            body: JSON.stringify({ note: attribText }),
-          });
-        } catch (e) { /* notes endpoint may not be available — non-fatal */ }
-      }
-      return res.status(200).json({
-        ok: true, prospect_id: newId, action: prospectId ? "updated" : "created",
-        attribution: attribJson,
-      });
-    } else {
-      return res.status(500).json({
-        ok: false, error: "bonzo_error", status: result && result.status,
-        body: result && (result.json || result.text),
-      });
-    }
-  } catch (err) {
-    console.error("[lead/inbound] error:", err);
-    return res.status(500).json({ ok: false, error: String(err.message || err) });
-  }
-});
-
 // POST /meta/capi — server-side Meta Conversions API event sender.
 // Sends a Lead/Purchase/CompleteRegistration event to your Meta Pixel,
 // using hashed email/phone for matching, with optional click_id/fbp/fbc.
@@ -1089,6 +996,175 @@ app.post("/meta/capi", async (req, res) => {
 });
 
 // =========================================================
+
+
+// === COWORK PATCH 2026-04-29: enhanced /lead/inbound with attribution -> custom fields ===
+
+// Extract a flat key->value map from any of the three supported body shapes:
+//   1. Direct JSON: {email, gclid, utm_source, ...}
+//   2. Elementor structured JSON: {form_id, form_name, fields:{email:{value}, gclid:{value}, ...}}
+//   3. form-encoded with `form_fields[KEY]=VALUE` (Elementor default webhook)
+function _coworkExtractAttribution(body) {
+  const flat = {};
+  if (!body || typeof body !== "object") return flat;
+  if (body.fields && typeof body.fields === "object" && !Array.isArray(body.fields)) {
+    // Elementor structured JSON
+    for (const [k, v] of Object.entries(body.fields)) {
+      flat[k] = (v && typeof v === "object") ? (v.value ?? v.raw_value ?? "") : v;
+    }
+    // Carry over top-level form metadata too
+    if (body.form_id) flat.form_id = body.form_id;
+    if (body.form_name) flat.form_name = body.form_name;
+  } else {
+    // Direct or form-encoded
+    for (const [k, v] of Object.entries(body)) {
+      const m = k.match(/^form_fields\[([^\]]+)\]$/);
+      if (m) {
+        flat[m[1]] = v;
+      } else {
+        flat[k] = v;
+      }
+    }
+  }
+  return flat;
+}
+
+function _coworkAttributionTags(flat) {
+  return {
+    lead_source: flat.lead_source || flat.utm_source || flat.form_name || "website",
+    gclid: flat.gclid || "",
+    fbclid: flat.fbclid || "",
+    utm_source: flat.utm_source || "",
+    utm_medium: flat.utm_medium || "",
+    utm_campaign: flat.utm_campaign || "",
+    utm_term: flat.utm_term || "",
+    utm_content: flat.utm_content || "",
+    landing_page: flat.landing_page || flat.page_url || "",
+    page_referrer: flat.page_referrer || "",
+  };
+}
+
+async function _coworkHandleInbound(req, res) {
+  try {
+    const flat = _coworkExtractAttribution(req.body);
+    const email = (flat.email || "").toString().trim();
+    const phone = (flat.phone || flat.phone_number || "").toString().trim();
+    if (!email && !phone) {
+      return res.status(400).json({ ok: false, error: "email or phone required" });
+    }
+    const attr = _coworkAttributionTags(flat);
+    const first_name = flat.first_name || "";
+    const last_name = flat.last_name || "";
+
+    const bonzoBase = process.env.BONZO_BASE_URL || "https://app.getbonzo.com/api";
+    const bonzoToken = process.env.BONZO_TOKEN || process.env.BONZO_API_KEY;
+    const headers = {
+      "Authorization": `Bearer ${bonzoToken}`,
+      "Content-Type": "application/json",
+      "Accept": "application/json",
+      "User-Agent": "Mozilla/5.0 (compatible) bonzo-sync",
+    };
+
+    // Look up existing prospect by email or phone to decide create-vs-update
+    let existing = null;
+    if (email) {
+      const r = await fetch(`${bonzoBase}/v3/prospects?email=${encodeURIComponent(email)}&per_page=1`, { headers });
+      if (r.ok) {
+        const j = await r.json();
+        if (Array.isArray(j.data) && j.data.length) existing = j.data[0];
+      }
+    }
+    if (!existing && phone) {
+      const r = await fetch(`${bonzoBase}/v3/prospects?phone=${encodeURIComponent(phone)}&per_page=1`, { headers });
+      if (r.ok) {
+        const j = await r.json();
+        if (Array.isArray(j.data) && j.data.length) existing = j.data[0];
+      }
+    }
+
+    // Build prospect payload (top-level fields keyed by label_normalized — what Bonzo's API accepts)
+    const prospectPayload = {
+      first_name, last_name, email: email || undefined, phone: phone || undefined,
+      lead_source: attr.lead_source,
+      gclid: attr.gclid || undefined,
+      fbclid: attr.fbclid || undefined,
+      utm_source: attr.utm_source || undefined,
+      utm_medium: attr.utm_medium || undefined,
+      utm_campaign: attr.utm_campaign || undefined,
+      utm_term: attr.utm_term || undefined,
+      utm_content: attr.utm_content || undefined,
+      landing_page: attr.landing_page || undefined,
+      page_referrer: attr.page_referrer || undefined,
+    };
+
+    let prospectId = null;
+    let action = null;
+    if (existing) {
+      prospectId = existing.id;
+      action = "updated";
+      const r = await fetch(`${bonzoBase}/v3/prospects/${prospectId}`, {
+        method: "PUT",
+        headers,
+        body: JSON.stringify(prospectPayload),
+      });
+      if (!r.ok) {
+        const t = await r.text();
+        console.error("PUT prospect failed", r.status, t.slice(0, 500));
+      }
+    } else {
+      const r = await fetch(`${bonzoBase}/v3/prospects`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(prospectPayload),
+      });
+      if (r.ok) {
+        const j = await r.json();
+        prospectId = (j.data && j.data.id) || j.id;
+        action = "created";
+      } else {
+        const t = await r.text();
+        console.error("POST prospect failed", r.status, t.slice(0, 500));
+        return res.status(502).json({ ok: false, error: "bonzo_create_failed", status: r.status, body: t.slice(0, 300) });
+      }
+    }
+
+    // Also leave a note for safekeeping (audit trail)
+    if (prospectId) {
+      try {
+        const noteBody = "Cowork attribution capture:\n" + JSON.stringify(attr, null, 2);
+        await fetch(`${bonzoBase}/v3/prospects/${prospectId}/notes`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ note: noteBody }),
+        });
+      } catch (e) { /* ignore */ }
+    }
+
+    return res.json({
+      ok: true,
+      prospect_id: prospectId,
+      action,
+      attribution: attr,
+      received_at: new Date().toISOString(),
+    });
+  } catch (e) {
+    console.error("inbound error", e && e.stack || e);
+    return res.status(500).json({ ok: false, error: e.message || String(e) });
+  }
+}
+
+// Legacy endpoint with header auth (kept for backward compat)
+app.post("/lead/inbound", express.urlencoded({ extended: true }), express.json(), (req, res) => {
+  if (req.header("x-lead-code") !== process.env.LEAD_INBOUND_CODE) return res.status(401).send("Unauthorized");
+  return _coworkHandleInbound(req, res);
+});
+
+// New path-based variant: Elementor can call this without custom headers
+app.post("/lead/inbound/:code", express.urlencoded({ extended: true }), express.json(), (req, res) => {
+  if (req.params.code !== process.env.LEAD_INBOUND_CODE) return res.status(401).send("Unauthorized");
+  return _coworkHandleInbound(req, res);
+});
+// === END COWORK PATCH ===
 
 app.listen(process.env.PORT || 3000, () => {
   console.log("Server running");
