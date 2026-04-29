@@ -1458,43 +1458,54 @@ function _coworkPCMatch(email, phone) {
 
 // POST /customer-match/upload/:code — receive past-client list
 app.post("/customer-match/upload/:code", express.json({limit: "50mb"}), function(req, res) {
-  if (req.params.code !== process.env.LEAD_INBOUND_CODE) return res.status(401).json({ok:false, error:"Unauthorized"});
-  const todayRate = parseFloat(req.body.todays_rate || 6.5);
-  const records = req.body.records || [];
-  if (!Array.isArray(records)) return res.status(400).json({ok:false, error:"records[] required"});
-  const cache = { records: [], by_email_hash: {}, by_phone_hash: {}, generated: new Date().toISOString() };
-  for (let i = 0; i < records.length; i++) {
-    const r = records[i];
-    const email = (r.email || "").toLowerCase().trim();
-    const phoneClean = String(r.phone || "").replace(/\D/g,"");
-    const savings = _coworkComputeSavings(r, todayRate);
-    const stored = {
-      idx: i,
-      eh: email ? _coworkSha256Hex(email) : null,
-      ph: phoneClean ? _coworkSha256Hex(phoneClean) : null,
-      first_name: r.first_name || "",
-      last_name: r.last_name || "",
-      original_loan_amount: r.original_loan_amount || null,
-      original_rate: r.original_rate || null,
-      closing_date: r.closing_date || null,
-      original_property_address: r.original_property_address || r.property_address || "",
-      loan_type: r.loan_type || "",
-      loan_purpose: r.loan_purpose || "",
-      savings: savings
-    };
-    cache.records.push(stored);
-    if (stored.eh) cache.by_email_hash[stored.eh] = i;
-    if (stored.ph) cache.by_phone_hash[stored.ph] = i;
+  try {
+    if (req.params.code !== process.env.LEAD_INBOUND_CODE) return res.status(401).json({ok:false, error:"Unauthorized"});
+    const todayRate = parseFloat(req.body.todays_rate || 6.5);
+    const records = req.body.records || [];
+    if (!Array.isArray(records)) return res.status(400).json({ok:false, error:"records[] required"});
+    const cache = { records: [], by_email_hash: {}, by_phone_hash: {}, generated: new Date().toISOString() };
+    for (let i = 0; i < records.length; i++) {
+      try {
+        const r = records[i];
+        const email = (r.email || "").toLowerCase().trim();
+        const phoneClean = String(r.phone || "").replace(/\D/g,"");
+        let savings = null;
+        try { savings = _coworkComputeSavings(r, todayRate); } catch (sx) { savings = null; }
+        let eh = null, ph = null;
+        if (email) { try { eh = _coworkSha256Hex(email); } catch (hx) {} }
+        if (phoneClean) { try { ph = _coworkSha256Hex(phoneClean); } catch (hx) {} }
+        const stored = {
+          idx: i, eh: eh, ph: ph,
+          first_name: r.first_name || "",
+          last_name: r.last_name || "",
+          original_loan_amount: r.original_loan_amount || null,
+          original_rate: r.original_rate || null,
+          closing_date: r.closing_date || null,
+          original_property_address: r.original_property_address || r.property_address || "",
+          loan_type: r.loan_type || "",
+          loan_purpose: r.loan_purpose || "",
+          savings: savings
+        };
+        cache.records.push(stored);
+        if (eh) cache.by_email_hash[eh] = i;
+        if (ph) cache.by_phone_hash[ph] = i;
+      } catch (rowErr) {
+        console.error("[PCM upload row " + i + "]", rowErr && rowErr.message);
+      }
+    }
+    _pcmCache = cache;
+    try { _coworkPCMSave(); } catch (sx) { console.error("[PCM save]", sx.message); }
+    return res.status(200).json({
+      ok: true,
+      records_stored: cache.records.length,
+      with_email: Object.keys(cache.by_email_hash).length,
+      with_phone: Object.keys(cache.by_phone_hash).length,
+      with_savings: cache.records.filter(rr=>rr.savings).length
+    });
+  } catch (err) {
+    console.error("[PCM upload]", err && err.stack || err);
+    return res.status(500).json({ok:false, error: String(err && err.message || err), stack: String(err && err.stack || "").slice(0,1500)});
   }
-  _pcmCache = cache;
-  _coworkPCMSave();
-  return res.status(200).json({
-    ok: true,
-    records_stored: cache.records.length,
-    with_email: Object.keys(cache.by_email_hash).length,
-    with_phone: Object.keys(cache.by_phone_hash).length,
-    with_savings: cache.records.filter(r=>r.savings).length
-  });
 });
 
 // GET /customer-match/status/:code — health/diagnostic
