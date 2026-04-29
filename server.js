@@ -1379,6 +1379,139 @@ app.post("/google-ads/upload-conversion", express.json(), function(req, res) {
 });
 // === END COWORK ===
 
+// === COWORK 2026-04-29: Past-Client Customer Match infrastructure ===
+const _PCM_DISK = "/tmp/past_clients.json";
+let _pcmCache = null;
+
+function _coworkSha256Hex(s) {
+  // Reuse existing helper if present, else compute
+  return require("crypto").createHash("sha256").update(String(s||"").toLowerCase().trim()).digest("hex");
+}
+
+function _coworkPCMLoad() {
+  if (_pcmCache) return _pcmCache;
+  try {
+    const fs = require("fs");
+    if (fs.existsSync(_PCM_DISK)) {
+      _pcmCache = JSON.parse(fs.readFileSync(_PCM_DISK, "utf8"));
+      return _pcmCache;
+    }
+  } catch (e) { console.error("PCM load:", e.message); }
+  _pcmCache = { records: [], by_email_hash: {}, by_phone_hash: {}, generated: null };
+  return _pcmCache;
+}
+
+function _coworkPCMSave() {
+  try {
+    const fs = require("fs");
+    fs.writeFileSync(_PCM_DISK, JSON.stringify(_pcmCache));
+  } catch (e) { console.error("PCM save:", e.message); }
+}
+
+function _coworkComputeSavings(rec, todayRate) {
+  // rec: {original_loan_amount, original_rate, closing_date, loan_term_months}
+  // todayRate: e.g. 6.5 (percent)
+  try {
+    const P = parseFloat(rec.original_loan_amount || 0);
+    const origR = parseFloat(rec.original_rate || 0);
+    const todayR = parseFloat(todayRate || 6.5);
+    const term = parseInt(rec.loan_term_months || 360);
+    if (!P || !origR || origR <= todayR) return null;
+    const monthsElapsed = rec.closing_date ?
+      Math.min(term - 1, Math.max(0, Math.floor(
+        (Date.now() - new Date(rec.closing_date).getTime()) / (1000*60*60*24*30.4375)
+      ))) : 0;
+    const r1 = origR / 100 / 12;
+    const r2 = todayR / 100 / 12;
+    // Monthly P&I on original
+    const pmt1 = P * r1 / (1 - Math.pow(1+r1, -term));
+    // Estimated current balance (amortization)
+    const bal = P * (Math.pow(1+r1, term) - Math.pow(1+r1, monthsElapsed)) / (Math.pow(1+r1, term) - 1);
+    const remTerm = term - monthsElapsed;
+    // New monthly P&I on remaining balance, new term (assume 30yr)
+    const newTerm = 360;
+    const pmt2 = bal * r2 / (1 - Math.pow(1+r2, -newTerm));
+    const monthlySavings = pmt1 - pmt2;
+    const totalSavings = monthlySavings * remTerm;
+    const closingCosts = bal * 0.025; // 2.5% est
+    const breakEvenMonths = monthlySavings > 0 ? Math.ceil(closingCosts / monthlySavings) : null;
+    return {
+      estimated_balance: Math.round(bal),
+      current_pi: Math.round(pmt1*100)/100,
+      new_pi: Math.round(pmt2*100)/100,
+      monthly_savings: Math.round(monthlySavings*100)/100,
+      total_savings: Math.round(totalSavings),
+      break_even_months: breakEvenMonths,
+      todays_rate: todayR
+    };
+  } catch (e) { return null; }
+}
+
+function _coworkPCMatch(email, phone) {
+  const c = _coworkPCMLoad();
+  const eh = email ? _coworkSha256Hex(email) : null;
+  const ph = phone ? _coworkSha256Hex(String(phone).replace(/\D/g,"")) : null;
+  if (eh && c.by_email_hash[eh]) return c.records[c.by_email_hash[eh]];
+  if (ph && c.by_phone_hash[ph]) return c.records[c.by_phone_hash[ph]];
+  return null;
+}
+
+// POST /customer-match/upload/:code — receive past-client list
+app.post("/customer-match/upload/:code", express.json({limit: "50mb"}), function(req, res) {
+  if (req.params.code !== process.env.LEAD_INBOUND_CODE) return res.status(401).json({ok:false, error:"Unauthorized"});
+  const todayRate = parseFloat(req.body.todays_rate || 6.5);
+  const records = req.body.records || [];
+  if (!Array.isArray(records)) return res.status(400).json({ok:false, error:"records[] required"});
+  const cache = { records: [], by_email_hash: {}, by_phone_hash: {}, generated: new Date().toISOString() };
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i];
+    const email = (r.email || "").toLowerCase().trim();
+    const phoneClean = String(r.phone || "").replace(/\D/g,"");
+    const savings = _coworkComputeSavings(r, todayRate);
+    const stored = {
+      idx: i,
+      eh: email ? _coworkSha256Hex(email) : null,
+      ph: phoneClean ? _coworkSha256Hex(phoneClean) : null,
+      first_name: r.first_name || "",
+      last_name: r.last_name || "",
+      original_loan_amount: r.original_loan_amount || null,
+      original_rate: r.original_rate || null,
+      closing_date: r.closing_date || null,
+      original_property_address: r.original_property_address || r.property_address || "",
+      loan_type: r.loan_type || "",
+      loan_purpose: r.loan_purpose || "",
+      savings: savings
+    };
+    cache.records.push(stored);
+    if (stored.eh) cache.by_email_hash[stored.eh] = i;
+    if (stored.ph) cache.by_phone_hash[stored.ph] = i;
+  }
+  _pcmCache = cache;
+  _coworkPCMSave();
+  return res.status(200).json({
+    ok: true,
+    records_stored: cache.records.length,
+    with_email: Object.keys(cache.by_email_hash).length,
+    with_phone: Object.keys(cache.by_phone_hash).length,
+    with_savings: cache.records.filter(r=>r.savings).length
+  });
+});
+
+// GET /customer-match/status/:code — health/diagnostic
+app.get("/customer-match/status/:code", function(req, res) {
+  if (req.params.code !== process.env.LEAD_INBOUND_CODE) return res.status(401).json({ok:false});
+  const c = _coworkPCMLoad();
+  return res.status(200).json({
+    ok: true,
+    generated: c.generated,
+    record_count: c.records.length,
+    with_email: Object.keys(c.by_email_hash).length,
+    with_phone: Object.keys(c.by_phone_hash).length
+  });
+});
+
+// === END COWORK Past-Client Customer Match ===
+
 app.listen(process.env.PORT || 3000, () => {
   console.log("Server running");
 });
