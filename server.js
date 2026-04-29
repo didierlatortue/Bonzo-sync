@@ -1364,7 +1364,7 @@ async function _coworkHandleAdsUpload(req, res) {
 }
 
 // Path-based auth (same shape as /lead/inbound/:code) plus header-based fallback
-app.post("/google-ads/upload-conversion/:code", express.json(), function(req, res) {
+app.post("/google-ads/upload-conversion/:code", express.json({limit:'50mb'}), function(req, res) {
   if (req.params.code !== process.env.LEAD_INBOUND_CODE) {
     return res.status(401).json({ ok: false, error: "Unauthorized" });
   }
@@ -1511,6 +1511,47 @@ app.get("/customer-match/status/:code", function(req, res) {
 });
 
 // === END COWORK Past-Client Customer Match ===
+// === COWORK 2026-04-29: PCM v3 — match enrichment + past-client conversion variant ===
+const _coworkPCMv3 = true;
+
+// Wrap _coworkExtractAttribution to also enrich with past-client data
+if (typeof _coworkExtractAttribution === "function" && typeof _coworkPCMatch === "function") {
+  const _origExtract = _coworkExtractAttribution;
+  _coworkExtractAttribution = function(body) {
+    const flat = _origExtract(body);
+    try {
+      const email = (flat.email || "").toLowerCase().trim();
+      const phone = String(flat.phone || flat.phone_number || "").replace(/\D/g, "");
+      const match = _coworkPCMatch(email, phone);
+      if (match) {
+        // Tag this submission as a past-client re-engagement
+        flat.lead_source = "Past Client - Re-engaged";
+        flat.past_client_match = "yes";
+        // Populate built-in mortgage fields with stored data
+        if (match.original_loan_amount) flat.loan_amount = match.original_loan_amount;
+        if (match.original_rate) flat.interest_rate = match.original_rate;
+        if (match.original_property_address) flat.property_address = match.original_property_address;
+        if (match.loan_type) flat.loan_type = match.loan_type;
+        // Savings custom fields
+        if (match.savings) {
+          if (match.savings.monthly_savings != null) flat.estimated_monthly_savings = match.savings.monthly_savings;
+          if (match.savings.total_savings != null) flat.estimated_total_savings = match.savings.total_savings;
+          if (match.savings.monthly_savings > 0) flat.refinder_eligible = "yes";
+        }
+        flat.past_client_meta = {
+          first_name_orig: match.first_name,
+          last_name_orig: match.last_name,
+          closing_date: match.closing_date,
+          loan_purpose: match.loan_purpose
+        };
+        console.log("[PCM] match enriched email=" + (email.slice(0,3) + "***") + " savings=" + (match.savings && match.savings.monthly_savings));
+      }
+    } catch (e) { console.error("[PCM] enrich error:", e.message); }
+    return flat;
+  };
+}
+// === END COWORK PCM v3 ===
+
 
 app.listen(process.env.PORT || 3000, () => {
   console.log("Server running");
