@@ -1213,6 +1213,70 @@ app.post("/lead/inbound/:code", (req, res) => {
 });
 // === END COWORK PATCH ===
 
+
+// === COWORK 2026-04-29: /calendly endpoint — Calendly invitee.created webhook ===
+function _coworkExtractCalendly(body) {
+  // Calendly v2 webhook payload shape:
+  //   { event: "invitee.created" | "invitee.canceled",
+  //     created_at, payload: { uri, name, first_name, last_name, email,
+  //                            timezone, questions_and_answers, tracking,
+  //                            scheduled_event: { uri, name, start_time, end_time, location } } }
+  if (!body || typeof body !== "object") return {};
+  const p = body.payload || {};
+  const tracking = p.tracking || {};
+  const evt = p.scheduled_event || {};
+  const event_type_name = evt.name || "Calendly Booking";
+  const start = evt.start_time || "";
+  return {
+    email: p.email || "",
+    phone: p.text_reminder_number || "",
+    first_name: p.first_name || (p.name || "").split(" ")[0] || "",
+    last_name: p.last_name || (p.name || "").split(" ").slice(1).join(" ") || "",
+    lead_source: event_type_name + (start ? (" @ " + start) : ""),
+    gclid: tracking.salesforce_uuid || "",
+    utm_source: tracking.utm_source || "",
+    utm_medium: tracking.utm_medium || "",
+    utm_campaign: tracking.utm_campaign || "",
+    utm_term: tracking.utm_term || "",
+    utm_content: tracking.utm_content || "",
+    landing_page: p.routing_form_uri || "",
+    page_referrer: "",
+    fbclid: "",
+    calendly_event_uri: evt.uri || "",
+    calendly_event_start_time: start,
+    calendly_event_name: event_type_name,
+  };
+}
+
+async function _coworkHandleCalendly(req, res) {
+  try {
+    const event = (req.body || {}).event || "";
+    if (event && event !== "invitee.created" && event !== "invitee.canceled") {
+      return res.status(200).json({ ok: true, ignored: event });
+    }
+    const flat = _coworkExtractCalendly(req.body);
+    if (!flat.email && !flat.phone) {
+      return res.status(400).json({ ok: false, error: "email or phone required (Calendly payload missing)" });
+    }
+    // Reuse the same handler as /lead/inbound — it handles dedupe + Bonzo prospect upsert
+    req.body = flat;
+    return _coworkHandleInbound(req, res);
+  } catch (e) {
+    console.error("calendly error", e && e.stack || e);
+    return res.status(500).json({ ok: false, error: e.message || String(e) });
+  }
+}
+
+app.post("/calendly", (req, res) => {
+  if (req.header("x-calendly-code") !== process.env.LEAD_INBOUND_CODE) return res.status(401).send("Unauthorized");
+  return _coworkHandleCalendly(req, res);
+});
+app.post("/calendly/:code", (req, res) => {
+  if (req.params.code !== process.env.LEAD_INBOUND_CODE) return res.status(401).send("Unauthorized");
+  return _coworkHandleCalendly(req, res);
+});
+// === END COWORK CALENDLY PATCH ===
+
 app.listen(process.env.PORT || 3000, () => {
   console.log("Server running");
 });
