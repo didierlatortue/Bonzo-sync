@@ -875,6 +875,17 @@ app.post("/scan-bounces", async (req, res) => {
 });
 
 app.get("/", (req, res) => res.status(200).send("ok"));
+
+// ----- Cowork: phase 1 health check (added by deployment script) -----
+app.get("/ping", (req, res) => {
+  res.status(200).json({
+    ok: true,
+    service: "bonzo-sync",
+    message: "alive",
+    timestamp: new Date().toISOString(),
+  });
+});
+
 app.listen(process.env.PORT || 3000, () => {
   console.log("Server running");
 });
