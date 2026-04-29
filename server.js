@@ -1008,23 +1008,38 @@ app.post("/meta/capi", async (req, res) => {
 function _coworkExtractAttribution(body) {
   const flat = {};
   if (!body || typeof body !== "object") return flat;
+
+  // Shape A: Elementor structured JSON {fields:{name:{value}}}
   if (body.fields && typeof body.fields === "object" && !Array.isArray(body.fields)) {
-    // Elementor structured JSON
     for (const [k, v] of Object.entries(body.fields)) {
       flat[k] = (v && typeof v === "object") ? (v.value ?? v.raw_value ?? "") : v;
     }
-    // Carry over top-level form metadata too
     if (body.form_id) flat.form_id = body.form_id;
     if (body.form_name) flat.form_name = body.form_name;
-  } else {
-    // Direct or form-encoded
+    return flat;
+  }
+
+  // Shape B: form-encoded parsed by qs (extended:true) -> body.form_fields is an object
+  if (body.form_fields && typeof body.form_fields === "object" && !Array.isArray(body.form_fields)) {
+    for (const [k, v] of Object.entries(body.form_fields)) {
+      flat[k] = (v && typeof v === "object") ? (v.value ?? v.raw_value ?? "") : v;
+    }
+    if (body.form_id) flat.form_id = body.form_id;
+    if (body.form_name) flat.form_name = body.form_name;
+    // Carry over any sibling top-level keys too
     for (const [k, v] of Object.entries(body)) {
-      const m = k.match(/^form_fields\[([^\]]+)\]$/);
-      if (m) {
-        flat[m[1]] = v;
-      } else {
-        flat[k] = v;
-      }
+      if (k !== "form_fields" && !(k in flat)) flat[k] = v;
+    }
+    return flat;
+  }
+
+  // Shape C: literal-key form-encoded (extended:false) OR flat JSON
+  for (const [k, v] of Object.entries(body)) {
+    const m = k.match(/^form_fields\[([^\]]+)\]$/);
+    if (m) {
+      flat[m[1]] = v;
+    } else {
+      flat[k] = v;
     }
   }
   return flat;
