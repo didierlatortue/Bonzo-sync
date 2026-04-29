@@ -1277,6 +1277,108 @@ app.post("/calendly/:code", (req, res) => {
 });
 // === END COWORK CALENDLY PATCH ===
 
+// === COWORK 2026-04-29: /google-ads/upload-conversion ===
+let _coworkAdsToken = null;
+let _coworkAdsTokenExp = 0;
+async function _coworkGetAdsToken() {
+  const now = Date.now();
+  if (_coworkAdsToken && now < _coworkAdsTokenExp - 60000) return _coworkAdsToken;
+  const body = new URLSearchParams({
+    client_id: process.env.GOOGLE_CLIENT_ID,
+    client_secret: process.env.GOOGLE_CLIENT_SECRET,
+    refresh_token: process.env.GOOGLE_REFRESH_TOKEN,
+    grant_type: "refresh_token",
+  }).toString();
+  const r = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body
+  });
+  if (!r.ok) throw new Error("OAuth refresh failed: HTTP " + r.status + " " + (await r.text()).slice(0,200));
+  const j = await r.json();
+  _coworkAdsToken = j.access_token;
+  _coworkAdsTokenExp = now + ((j.expires_in || 3600) * 1000);
+  return _coworkAdsToken;
+}
+
+async function _coworkHandleAdsUpload(req, res) {
+  try {
+    const b = req.body || {};
+    const gclid = b.gclid || b.GCLID;
+    if (!gclid) return res.status(400).json({ ok: false, error: "gclid required" });
+    const value = parseFloat(b.conversion_value || b.value || 0);
+    const currency = (b.currency_code || b.currency || "USD").toUpperCase();
+    // conversion_time required by Google: RFC3339 with timezone, e.g. "2026-04-29 12:34:56-04:00"
+    let ct = b.conversion_time || b.timestamp;
+    if (!ct) {
+      // Build "YYYY-MM-DD HH:mm:ss-04:00" from now
+      const d = new Date();
+      const pad = n => String(n).padStart(2,"0");
+      const tz = -d.getTimezoneOffset();
+      const sign = tz >= 0 ? "+" : "-";
+      const tzh = pad(Math.floor(Math.abs(tz)/60));
+      const tzm = pad(Math.abs(tz)%60);
+      ct = d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate())+" "+
+           pad(d.getHours())+":"+pad(d.getMinutes())+":"+pad(d.getSeconds())+sign+tzh+":"+tzm;
+    }
+    const orderId = b.order_id || b.gclid + "-" + Date.now();
+    const convResource = "customers/" + process.env.GOOGLE_ADS_CUSTOMER_ID +
+      "/conversionActions/" + (b.conversion_action_id || process.env.GOOGLE_ADS_FUNDED_LOAN_CONV_ID);
+    const access = await _coworkGetAdsToken();
+    const url = "https://googleads.googleapis.com/v20/customers/" +
+      process.env.GOOGLE_ADS_CUSTOMER_ID + ":uploadClickConversions";
+    const payload = {
+      conversions: [{
+        gclid: gclid,
+        conversionAction: convResource,
+        conversionDateTime: ct,
+        conversionValue: value,
+        currencyCode: currency,
+        orderId: orderId
+      }],
+      partialFailure: true,
+      validateOnly: !!b.validate_only
+    };
+    const r = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + access,
+        "developer-token": process.env.GOOGLE_ADS_DEVELOPER_TOKEN,
+        "login-customer-id": process.env.GOOGLE_ADS_MCC_ID,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    });
+    const text = await r.text();
+    let parsed; try { parsed = JSON.parse(text); } catch { parsed = { raw: text.slice(0,800) }; }
+    return res.status(r.ok ? 200 : 502).json({
+      ok: r.ok,
+      http: r.status,
+      conversion_action_id: b.conversion_action_id || process.env.GOOGLE_ADS_FUNDED_LOAN_CONV_ID,
+      sent: { gclid, value, currency, conversion_time: ct, order_id: orderId },
+      google: parsed
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: String(e && e.message || e) });
+  }
+}
+
+// Path-based auth (same shape as /lead/inbound/:code) plus header-based fallback
+app.post("/google-ads/upload-conversion/:code", express.json(), function(req, res) {
+  if (req.params.code !== process.env.LEAD_INBOUND_CODE) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+  return _coworkHandleAdsUpload(req, res);
+});
+app.post("/google-ads/upload-conversion", express.json(), function(req, res) {
+  const code = req.headers["x-lead-code"] || "";
+  if (code !== process.env.LEAD_INBOUND_CODE) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+  return _coworkHandleAdsUpload(req, res);
+});
+// === END COWORK ===
+
 app.listen(process.env.PORT || 3000, () => {
   console.log("Server running");
 });
