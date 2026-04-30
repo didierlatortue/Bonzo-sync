@@ -1131,9 +1131,25 @@ async function _coworkHandleInbound(req, res) {
     if (email) existing = await _findBy(email, "email");
     if (!existing && phone) existing = await _findBy(phone, "phone");
 
-    // Build prospect payload (top-level fields keyed by label_normalized — what Bonzo's API accepts)
-    const prospectPayload = {
-      first_name, last_name, email: email || undefined, phone: phone || undefined,
+    // Forward to the appropriate Bonzo webhook URL so the prospect lands in
+    // Buffer / Lead Entered with full Got Lead routing chain.
+    // Webhook hashes (from .cowork.env / earlier audit):
+    //   Refinance:  ddb05f5431f315e374231b2597e1da01
+    //   Purchase:   3ec807d03f29ec10046232c3e1a55670
+    // Choose based on the (possibly enriched) lead_source.
+    const _ls = (attr.lead_source || "").toString();
+    const _isPurchase = /Purchase/i.test(_ls);
+    const _whRefi = process.env.BONZO_WEBHOOK_REFINANCE_HASH || "ddb05f5431f315e374231b2597e1da01";
+    const _whPurch = process.env.BONZO_WEBHOOK_PURCHASE_HASH || "3ec807d03f29ec10046232c3e1a55670";
+    const _whHash = _isPurchase ? _whPurch : _whRefi;
+    const _whUrl = "https://app.getbonzo.com/api/webhook/" + _whHash;
+
+    // Forwarded body — flat keys mapped via webhook field-mapping config.
+    // Includes enriched fields from past-client matching.
+    const forwardBody = {
+      first_name, last_name,
+      email: email || undefined,
+      phone: phone || undefined,
       lead_source: attr.lead_source,
       gclid: attr.gclid || undefined,
       fbclid: attr.fbclid || undefined,
@@ -1144,36 +1160,78 @@ async function _coworkHandleInbound(req, res) {
       utm_content: attr.utm_content || undefined,
       landing_page: attr.landing_page || undefined,
       page_referrer: attr.page_referrer || undefined,
+      // Past-client enrichment (when match fired)
+      loan_amount: flat.loan_amount || undefined,
+      interest_rate: flat.interest_rate || undefined,
+      property_address: flat.property_address || undefined,
+      loan_type: flat.loan_type || undefined,
+      loan_purpose: flat.loan_purpose || undefined,
+      property_state: flat.property_state || undefined,
+      property_zip: flat.property_zip || undefined,
+      estimated_monthly_savings: flat.estimated_monthly_savings,
+      estimated_total_savings: flat.estimated_total_savings,
+      refinder_eligible: flat.refinder_eligible,
+      past_client_match: flat.past_client_match,
     };
 
     let prospectId = null;
     let action = null;
-    if (existing) {
-      prospectId = existing.id;
-      action = "updated";
-      const r = await fetch(`${bonzoBase}/prospects/${prospectId}`, {
-        method: "PUT",
-        headers,
-        body: JSON.stringify(prospectPayload),
-      });
-      if (!r.ok) {
-        const t = await r.text();
-        console.error("PUT prospect failed", r.status, t.slice(0, 500));
-      }
-    } else {
-      const r = await fetch(`${bonzoBase}/prospects`, {
+    let _whStatus = null;
+    try {
+      const wr = await fetch(_whUrl, {
         method: "POST",
-        headers,
-        body: JSON.stringify(prospectPayload),
+        headers: { "Content-Type": "application/json", "Accept": "application/json", "User-Agent": "Mozilla/5.0 (compatible) bonzo-sync" },
+        body: JSON.stringify(forwardBody),
       });
-      if (r.ok) {
-        const j = await r.json();
-        prospectId = (j.data && j.data.id) || j.id;
-        action = "created";
+      _whStatus = wr.status;
+      if (!wr.ok) {
+        const t = await wr.text();
+        console.error("Webhook forward failed", wr.status, t.slice(0, 400));
       } else {
-        const t = await r.text();
-        console.error("POST prospect failed", r.status, t.slice(0, 500));
-        return res.status(502).json({ ok: false, error: "bonzo_create_failed", status: r.status, body: t.slice(0, 300) });
+        action = "forwarded_to_webhook";
+        // Resolve prospect id by lookup (webhook is async, so we re-search)
+        await new Promise(r => setTimeout(r, 1500));
+        if (email) {
+          const found = await _findBy(email, "email");
+          if (found) prospectId = found.id;
+        }
+        if (!prospectId && phone) {
+          const found = await _findBy(phone, "phone");
+          if (found) prospectId = found.id;
+        }
+      }
+    } catch (e) {
+      console.error("Webhook forward exception", e && e.message);
+    }
+    // Fallback: if forward failed, still create via REST so we don't drop the lead
+    if (!prospectId) {
+      const prospectPayload = {
+        first_name, last_name, email: email || undefined, phone: phone || undefined,
+        lead_source: attr.lead_source,
+        gclid: attr.gclid || undefined,
+        fbclid: attr.fbclid || undefined,
+        utm_source: attr.utm_source || undefined,
+        utm_medium: attr.utm_medium || undefined,
+        utm_campaign: attr.utm_campaign || undefined,
+        utm_term: attr.utm_term || undefined,
+        utm_content: attr.utm_content || undefined,
+        landing_page: attr.landing_page || undefined,
+        page_referrer: attr.page_referrer || undefined,
+      };
+      if (existing) {
+        prospectId = existing.id; action = action || "updated_rest_fallback";
+        await fetch(`${bonzoBase}/prospects/${prospectId}`, { method: "PUT", headers, body: JSON.stringify(prospectPayload) });
+      } else {
+        const r = await fetch(`${bonzoBase}/prospects`, { method: "POST", headers, body: JSON.stringify(prospectPayload) });
+        if (r.ok) {
+          const j = await r.json();
+          prospectId = (j.data && j.data.id) || j.id;
+          action = action || "created_rest_fallback";
+        } else {
+          const t = await r.text();
+          console.error("POST prospect fallback failed", r.status, t.slice(0, 500));
+          return res.status(502).json({ ok: false, error: "bonzo_create_failed", status: r.status, body: t.slice(0, 300), webhook_status: _whStatus });
+        }
       }
     }
 
