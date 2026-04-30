@@ -1455,6 +1455,7 @@ function _coworkPCMatch(email, phone) {
   const c = _coworkPCMLoad();
   const eh = email ? _coworkSha256Hex(email) : null;
   const ph = phone ? _coworkSha256Hex(String(phone).replace(/\D/g,"")) : null;
+  console.log("[PCM] match() records=" + (c.records?c.records.length:"NULL") + " eh=" + (eh?eh.slice(0,8):"-") + " ph=" + (ph?ph.slice(0,8):"-") + " hit_e=" + !!(eh && c.by_email_hash[eh]) + " hit_p=" + !!(ph && c.by_phone_hash[ph]));
   if (eh && c.by_email_hash[eh]) return c.records[c.by_email_hash[eh]];
   if (ph && c.by_phone_hash[ph]) return c.records[c.by_phone_hash[ph]];
   return null;
@@ -1528,16 +1529,19 @@ app.get("/customer-match/status/:code", function(req, res) {
 // === END COWORK Past-Client Customer Match ===
 // === COWORK 2026-04-29: PCM v3 — match enrichment + past-client conversion variant ===
 const _coworkPCMv3 = true;
+console.log("[PCM] wrapper init typeof_extract=" + typeof _coworkExtractAttribution + " typeof_match=" + typeof _coworkPCMatch);
 
 // Wrap _coworkExtractAttribution to also enrich with past-client data
 if (typeof _coworkExtractAttribution === "function" && typeof _coworkPCMatch === "function") {
   const _origExtract = _coworkExtractAttribution;
   _coworkExtractAttribution = function(body) {
     const flat = _origExtract(body);
+    console.log("[PCM] wrapper called email=" + (flat.email||"").slice(0,8) + " phone=" + String(flat.phone||"").slice(0,6));
     try {
       const email = (flat.email || "").toLowerCase().trim();
       const phone = String(flat.phone || flat.phone_number || "").replace(/\D/g, "");
       const match = _coworkPCMatch(email, phone);
+      if (!match) console.log("[PCM] no match for email=" + email.slice(0,10));
       if (match) {
         // Tag this submission as a past-client re-engagement
         flat.lead_source = "Past Client - Re-engaged";
