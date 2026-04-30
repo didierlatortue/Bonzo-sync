@@ -1559,12 +1559,56 @@ app.post("/customer-match/upload/:code", express.json({limit: "50mb"}), function
     }
     _pcmCache = cache;
     try { _coworkPCMSave(); } catch (sx) { console.error("[PCM save]", sx.message); }
+
+    // === Push hashed list to Meta Custom Audiences in parallel ===
+    let metaResults = { all: null, refi: null };
+    try {
+      const META_TOKEN = process.env.META_ACCESS_TOKEN;
+      const META_ALL = process.env.META_AUDIENCE_PAST_CLIENT_ALL_ID;
+      const META_REFI = process.env.META_AUDIENCE_REFI_ELIGIBLE_ID;
+      if (META_TOKEN && META_ALL) {
+        // Build hashed user payloads
+        const allPayload = { schema: ["EMAIL", "PHONE"], data: [] };
+        const refiPayload = { schema: ["EMAIL", "PHONE"], data: [] };
+        for (const r of cache.records) {
+          // Lowercase trimmed email + digits-only phone, then SHA-256
+          // Build hashed values directly from already-hashed eh/ph (those are sha256 of lowercased+trimmed)
+          if (!r.eh && !r.ph) continue;
+          const row = [r.eh || "", r.ph || ""];
+          allPayload.data.push(row);
+          if (r.savings && r.savings.monthly_savings > 0) {
+            refiPayload.data.push(row);
+          }
+        }
+        async function metaUpload(audId, payload) {
+          if (!audId || payload.data.length === 0) return null;
+          const body = new URLSearchParams({
+            payload: JSON.stringify(payload),
+            access_token: META_TOKEN,
+          });
+          const r = await fetch("https://graph.facebook.com/v23.0/" + audId + "/users", {
+            method: "POST",
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: body.toString(),
+          });
+          const t = await r.text();
+          return { status: r.status, body: t.slice(0, 400), count: payload.data.length };
+        }
+        try { metaResults.all = await metaUpload(META_ALL, allPayload); } catch (e) { metaResults.all = { error: e.message }; }
+        if (META_REFI) {
+          try { metaResults.refi = await metaUpload(META_REFI, refiPayload); } catch (e) { metaResults.refi = { error: e.message }; }
+        }
+        console.log("[META audience] all=" + JSON.stringify(metaResults.all) + " refi=" + JSON.stringify(metaResults.refi));
+      }
+    } catch (e) { console.error("[META audience] push error:", e.message); }
+
     return res.status(200).json({
       ok: true,
       records_stored: cache.records.length,
       with_email: Object.keys(cache.by_email_hash).length,
       with_phone: Object.keys(cache.by_phone_hash).length,
-      with_savings: cache.records.filter(rr=>rr.savings).length
+      with_savings: cache.records.filter(rr=>rr.savings).length,
+      meta_audience: metaResults
     });
   } catch (err) {
     console.error("[PCM upload]", err && err.stack || err);
