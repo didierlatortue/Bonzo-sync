@@ -1455,9 +1455,9 @@ function _coworkPCMatch(email, phone) {
   const c = _coworkPCMLoad();
   const eh = email ? _coworkSha256Hex(email) : null;
   const ph = phone ? _coworkSha256Hex(String(phone).replace(/\D/g,"")) : null;
-  console.log("[PCM] match() records=" + (c.records?c.records.length:"NULL") + " eh=" + (eh?eh.slice(0,8):"-") + " ph=" + (ph?ph.slice(0,8):"-") + " hit_e=" + !!(eh && c.by_email_hash[eh]) + " hit_p=" + !!(ph && c.by_phone_hash[ph]));
-  if (eh && c.by_email_hash[eh]) return c.records[c.by_email_hash[eh]];
-  if (ph && c.by_phone_hash[ph]) return c.records[c.by_phone_hash[ph]];
+  console.log("[PCM] match() records=" + (c.records?c.records.length:"NULL") + " eh=" + (eh?eh.slice(0,8):"-") + " ph=" + (ph?ph.slice(0,8):"-") + " hit_e=" + !!(eh && Object.prototype.hasOwnProperty.call(c.by_email_hash,eh)) + " hit_p=" + !!(ph && Object.prototype.hasOwnProperty.call(c.by_phone_hash,ph)));
+  if (eh && Object.prototype.hasOwnProperty.call(c.by_email_hash, eh)) return c.records[c.by_email_hash[eh]];
+  if (ph && Object.prototype.hasOwnProperty.call(c.by_phone_hash, ph)) return c.records[c.by_phone_hash[ph]];
   return null;
 }
 
