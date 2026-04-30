@@ -1521,7 +1521,7 @@ function _coworkPCMatch(email, phone) {
 }
 
 // POST /customer-match/upload/:code — receive past-client list
-app.post("/customer-match/upload/:code", express.json({limit: "50mb"}), function(req, res) {
+app.post("/customer-match/upload/:code", express.json({limit: "50mb"}), async function(req, res) {
   try {
     if (req.params.code !== process.env.LEAD_INBOUND_CODE) return res.status(401).json({ok:false, error:"Unauthorized"});
     const todayRate = parseFloat(req.body.todays_rate || 6.5);
