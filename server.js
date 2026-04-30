@@ -1,4 +1,5 @@
 import express from "express";
+import fs from "fs";
 import fetch from "node-fetch";
 
 import { createHash as _coworkCreateHash } from "crypto";
@@ -1323,8 +1324,13 @@ async function _coworkHandleAdsUpload(req, res) {
            pad(d.getHours())+":"+pad(d.getMinutes())+":"+pad(d.getSeconds())+sign+tzh+":"+tzm;
     }
     const orderId = b.order_id || b.gclid + "-" + Date.now();
+    const _pcConvId = process.env.GOOGLE_ADS_FUNDED_LOAN_PAST_CLIENT_CONV_ID;
+    const _convId = b.conversion_action_id ||
+      ((b.past_client === true || b.past_client === "true" || b.past_client === 1) && _pcConvId
+        ? _pcConvId
+        : process.env.GOOGLE_ADS_FUNDED_LOAN_CONV_ID);
     const convResource = "customers/" + process.env.GOOGLE_ADS_CUSTOMER_ID +
-      "/conversionActions/" + (b.conversion_action_id || process.env.GOOGLE_ADS_FUNDED_LOAN_CONV_ID);
+      "/conversionActions/" + _convId;
     const access = await _coworkGetAdsToken();
     const url = "https://googleads.googleapis.com/v20/customers/" +
       process.env.GOOGLE_ADS_CUSTOMER_ID + ":uploadClickConversions";
@@ -1355,7 +1361,7 @@ async function _coworkHandleAdsUpload(req, res) {
     return res.status(r.ok ? 200 : 502).json({
       ok: r.ok,
       http: r.status,
-      conversion_action_id: b.conversion_action_id || process.env.GOOGLE_ADS_FUNDED_LOAN_CONV_ID,
+      conversion_action_id: _convId,
       sent: { gclid, value, currency, conversion_time: ct, order_id: orderId },
       google: parsed
     });
@@ -1391,7 +1397,6 @@ function _coworkSha256Hex(s) {
 function _coworkPCMLoad() {
   if (_pcmCache) return _pcmCache;
   try {
-    const fs = require("fs");
     if (fs.existsSync(_PCM_DISK)) {
       _pcmCache = JSON.parse(fs.readFileSync(_PCM_DISK, "utf8"));
       return _pcmCache;
@@ -1403,7 +1408,6 @@ function _coworkPCMLoad() {
 
 function _coworkPCMSave() {
   try {
-    const fs = require("fs");
     fs.writeFileSync(_PCM_DISK, JSON.stringify(_pcmCache));
   } catch (e) { console.error("PCM save:", e.message); }
 }
