@@ -1151,6 +1151,7 @@ async function _coworkHandleInbound(req, res) {
       email: email || undefined,
       phone: phone || undefined,
       lead_source: attr.lead_source,
+      form_name: flat.form_name || attr.lead_source,
       gclid: attr.gclid || undefined,
       fbclid: attr.fbclid || undefined,
       utm_source: attr.utm_source || undefined,
