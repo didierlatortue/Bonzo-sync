@@ -1417,12 +1417,45 @@ async function _coworkHandleAdsUpload(req, res) {
     });
     const text = await r.text();
     let parsed; try { parsed = JSON.parse(text); } catch { parsed = { raw: text.slice(0,800) }; }
+
+    // === Mirror to Meta CAPI ===
+    let metaCapi = null;
+    try {
+      const META_TOKEN = process.env.META_ACCESS_TOKEN;
+      const META_PIXEL = process.env.META_PIXEL_ID || "1879445049445130";
+      if (META_TOKEN && META_PIXEL) {
+        const evtName = (b.past_client === true || b.past_client === "true" || b.past_client === 1) ? "FundedLoanPastClient" : "FundedLoan";
+        const user_data = {};
+        if (b.email) user_data.em = [_coworkSha256Hex(b.email)];
+        if (b.phone) user_data.ph = [_coworkSha256Hex(String(b.phone).replace(/\D/g,""))];
+        if (b.fbp) user_data.fbp = b.fbp;
+        if (b.fbc) user_data.fbc = b.fbc;
+        const evtData = [{
+          event_name: evtName,
+          event_time: Math.floor(Date.now()/1000),
+          action_source: "system_generated",
+          event_source_url: "https://turturhomeloans.com/funded",
+          user_data: user_data,
+          custom_data: { currency: currency, value: value, order_id: orderId, past_client: !!b.past_client, gclid: gclid }
+        }];
+        const formBody = new URLSearchParams({ data: JSON.stringify(evtData), access_token: META_TOKEN });
+        const mr = await fetch("https://graph.facebook.com/v23.0/" + META_PIXEL + "/events", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: formBody.toString(),
+        });
+        metaCapi = { status: mr.status, body: (await mr.text()).slice(0, 300) };
+        console.log("[META CAPI] " + evtName + " status=" + mr.status);
+      }
+    } catch (mexc) { metaCapi = { error: mexc.message }; console.error("[META CAPI]", mexc.message); }
+
     return res.status(r.ok ? 200 : 502).json({
       ok: r.ok,
       http: r.status,
       conversion_action_id: _convId,
       sent: { gclid, value, currency, conversion_time: ct, order_id: orderId },
-      google: parsed
+      google: parsed,
+      meta_capi: metaCapi
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e && e.message || e) });
