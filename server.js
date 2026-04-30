@@ -1602,8 +1602,13 @@ if (typeof _coworkExtractAttribution === "function" && typeof _coworkPCMatch ===
       const match = _coworkPCMatch(email, phone);
       if (!match) console.log("[PCM] no match for email=" + email.slice(0,10));
       if (match) {
-        // Tag this submission as a past-client re-engagement
+        // Tag this submission as a past-client re-engagement.
+        // We also overwrite form_name because Bonzo webhooks map "Lead source ← form_name"
+        // — without this override, the form's original name (e.g. "Purchase Options Form")
+        // would land in mortgage.lead_source and the Got Lead "Lead type Past Client?"
+        // condition would not match.
         flat.lead_source = "Past Client - Re-engaged";
+        flat.form_name = "Past Client - Re-engaged";
         flat.past_client_match = "yes";
         // Populate built-in mortgage fields with stored data
         if (match.original_loan_amount) flat.loan_amount = match.original_loan_amount;
