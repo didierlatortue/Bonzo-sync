@@ -1857,7 +1857,7 @@ async function _autoDecideLeadFate(opts) {
   const minAgeHours = opts.minAgeHours || 24;
   const limit = opts.limit || 50;
   const listResp = await bonzoFetch("/prospects?pipeline_stage_id=" + TURTUR_NEW_LEAD_STAGE_ID + "&per_page=" + limit, { method: "GET" });
-  const prospects = (listResp && listResp.data) || [];
+  const prospects = (listResp && listResp.json && listResp.json.data) || [];
   const cutoff = Date.now() - minAgeHours * 60 * 60 * 1000;
   const eligible = prospects.filter(p => p.created_at && new Date(p.created_at).getTime() < cutoff);
   const results = [];
