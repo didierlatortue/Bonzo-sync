@@ -1809,6 +1809,90 @@ if (typeof _coworkExtractAttribution === "function" && typeof _coworkPCMatch ===
 // === END COWORK PCM v3 ===
 
 
+
+
+// === COWORK: Auto-decide lead fate ===
+const TURTUR_NEW_LEAD_STAGE_ID = 420154;
+const TURTUR_NURTURE_STAGE_ID = 411990;
+const TURTUR_BAD_LEAD_STAGE_ID = 411900;
+const TURTUR_PURCHASE_INSTANT_RESPONSE_ID = 212081;
+const TURTUR_BAD_CAMPAIGN_ID = 210023;
+const TURTUR_TEXT_NURTURE_CAMPAIGN_ID = 226237;
+const TURTUR_EMAIL_NURTURE_CAMPAIGN_ID = 226242;
+const TURTUR_EMAILTEXT_NURTURE_CAMPAIGN_ID = 226238;
+
+function _decideLeadFate(prospect) {
+  const tagNames = (prospect.tags || []).map(t => String(typeof t === "string" ? t : (t.name||"")).toLowerCase());
+  const hasBadEmail = tagNames.includes("bad_email");
+  const hasBadPhone = tagNames.includes("bad_phone");
+  if (prospect.do_not_call || (Array.isArray(prospect.opt_outs) && prospect.opt_outs.length > 0)) {
+    return { decision: "skip_opted_out", reason: "do_not_call or opt_out present" };
+  }
+  if (hasBadEmail && hasBadPhone) return { decision: "bad_lead", target_campaign_id: TURTUR_BAD_CAMPAIGN_ID, target_stage_id: TURTUR_BAD_LEAD_STAGE_ID };
+  if (hasBadEmail)                return { decision: "text_nurture", target_campaign_id: TURTUR_TEXT_NURTURE_CAMPAIGN_ID, target_stage_id: TURTUR_NURTURE_STAGE_ID };
+  if (hasBadPhone)                return { decision: "email_nurture", target_campaign_id: TURTUR_EMAIL_NURTURE_CAMPAIGN_ID, target_stage_id: TURTUR_NURTURE_STAGE_ID };
+  return { decision: "general_nurture", target_campaign_id: TURTUR_EMAILTEXT_NURTURE_CAMPAIGN_ID, target_stage_id: TURTUR_NURTURE_STAGE_ID };
+}
+
+async function _executeLeadDecision(prospect, decision) {
+  const actions = [];
+  try {
+    await bonzoFetch("/prospects/" + prospect.id, { method: "PUT", body: JSON.stringify({ pipeline_stage_id: decision.target_stage_id }) });
+    actions.push("moved_stage");
+  } catch (e) { actions.push("stage_err:" + e.message); }
+  try {
+    await bonzoFetch("/prospects/" + prospect.id + "/campaigns/" + TURTUR_PURCHASE_INSTANT_RESPONSE_ID, { method: "DELETE" });
+    actions.push("unenrolled_pir");
+  } catch (e) { actions.push("unenroll_err:" + e.message); }
+  try {
+    await bonzoFetch("/prospects/" + prospect.id + "/campaigns/" + decision.target_campaign_id + "/start", { method: "POST" });
+    actions.push("enrolled_target");
+  } catch (e) { actions.push("enroll_err:" + e.message); }
+  return actions;
+}
+
+async function _autoDecideLeadFate(opts) {
+  opts = opts || {};
+  const dryRun = opts.dryRun !== false;
+  const minAgeHours = opts.minAgeHours || 24;
+  const limit = opts.limit || 50;
+  const listResp = await bonzoFetch("/prospects?pipeline_stage_id=" + TURTUR_NEW_LEAD_STAGE_ID + "&per_page=" + limit, { method: "GET" });
+  const prospects = (listResp && listResp.data) || [];
+  const cutoff = Date.now() - minAgeHours * 60 * 60 * 1000;
+  const eligible = prospects.filter(p => p.created_at && new Date(p.created_at).getTime() < cutoff);
+  const results = [];
+  for (const p of eligible) {
+    const decision = _decideLeadFate(p);
+    const summary = {
+      id: p.id,
+      name: p.full_name || ((p.first_name||"") + " " + (p.last_name||"")).trim(),
+      tags: (p.tags || []).map(t => typeof t === "string" ? t : t.name),
+      decision: decision.decision,
+      target_campaign_id: decision.target_campaign_id,
+      target_stage_id: decision.target_stage_id
+    };
+    if (!dryRun && decision.target_campaign_id) {
+      summary.actions = await _executeLeadDecision(p, decision);
+    }
+    results.push(summary);
+  }
+  console.log("[auto-decide] dry_run=" + dryRun + " reviewed=" + eligible.length + "/" + prospects.length);
+  return { dry_run: dryRun, total_in_stage: prospects.length, eligible_count: eligible.length, results: results };
+}
+
+app.post("/auto-decide/:code", express.json({ limit: "1mb" }), async function(req, res) {
+  if (req.params.code !== process.env.LEAD_INBOUND_CODE) return res.status(401).json({ ok: false, error: "Unauthorized" });
+  try {
+    const dryRun = req.query.dry_run !== "false";
+    const minAgeHours = parseInt(req.query.min_age_hours, 10) || 24;
+    const limit = parseInt(req.query.limit, 10) || 50;
+    const out = await _autoDecideLeadFate({ dryRun: dryRun, minAgeHours: minAgeHours, limit: limit });
+    res.json(Object.assign({ ok: true }, out));
+  } catch (e) {
+    res.status(500).json({ ok: false, error: String(e && e.message || e), stack: String(e && e.stack || "").slice(0, 1500) });
+  }
+});
+
 app.listen(process.env.PORT || 3000, () => {
   console.log("Server running");
 });
