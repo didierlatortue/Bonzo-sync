@@ -1362,6 +1362,71 @@ async function _coworkGetAdsToken() {
   return _coworkAdsToken;
 }
 
+async function _googleCustomerMatchUpload(cache) {
+  if (!cache || !cache.records || cache.records.length === 0) return null;
+  const dt = process.env.GOOGLE_ADS_DEVELOPER_TOKEN;
+  const cid = process.env.GOOGLE_ADS_CUSTOMER_ID;
+  const mcc = process.env.GOOGLE_ADS_MCC_ID;
+  const listId = process.env.GOOGLE_ADS_PAST_CLIENT_ALL_LIST_ID;
+  if (!dt || !cid || !mcc || !listId) return { error: 'missing google ads env vars' };
+  let token;
+  try { token = await _coworkGetAdsToken(); } catch (e) { return { error: 'token: ' + e.message }; }
+  if (!token) return { error: 'no token' };
+  const cleanCid = String(cid).replace(/-/g, '');
+  const cleanMcc = String(mcc).replace(/-/g, '');
+  const apiBase = 'https://googleads.googleapis.com/v20/customers/' + cleanCid;
+  const headers = {
+    'Authorization': 'Bearer ' + token,
+    'developer-token': dt,
+    'login-customer-id': cleanMcc,
+    'Content-Type': 'application/json'
+  };
+  const createBody = {
+    job: {
+      type: 'CUSTOMER_MATCH_USER_LIST',
+      customerMatchUserListMetadata: {
+        userList: 'customers/' + cleanCid + '/userLists/' + listId
+      }
+    }
+  };
+  const createResp = await fetch(apiBase + '/offlineUserDataJobs:create', {
+    method: 'POST', headers, body: JSON.stringify(createBody)
+  });
+  const createJson = await createResp.json();
+  const resourceName = createJson.resourceName;
+  if (!resourceName) return { create_status: createResp.status, error: createJson };
+  const operations = [];
+  for (const rec of cache.records) {
+    const ids = [];
+    if (rec.email) ids.push({ hashedEmail: _coworkSha256Hex(rec.email) });
+    if (rec.phone) {
+      const digits = String(rec.phone).replace(/\D/g, '');
+      if (digits) ids.push({ hashedPhoneNumber: _coworkSha256Hex('+1' + digits) });
+    }
+    if (ids.length > 0) operations.push({ create: { userIdentifiers: ids } });
+  }
+  const BATCH = 1000;
+  let totalAdded = 0;
+  let lastError = null;
+  for (let i = 0; i < operations.length; i += BATCH) {
+    const batch = operations.slice(i, i + BATCH);
+    const addResp = await fetch('https://googleads.googleapis.com/v20/' + resourceName + ':addOperations', {
+      method: 'POST', headers, body: JSON.stringify({ operations: batch, enablePartialFailure: true })
+    });
+    if (addResp.ok) {
+      totalAdded += batch.length;
+    } else {
+      lastError = { status: addResp.status, body: (await addResp.text()).slice(0, 800) };
+      break;
+    }
+  }
+  if (lastError) return { resource: resourceName, operations_added: totalAdded, error: lastError };
+  const runResp = await fetch('https://googleads.googleapis.com/v20/' + resourceName + ':run', {
+    method: 'POST', headers, body: '{}'
+  });
+  return { resource: resourceName, operations_added: totalAdded, list_id: listId, run_status: runResp.status };
+}
+
 async function _coworkHandleAdsUpload(req, res) {
   try {
     const b = req.body || {};
@@ -1663,13 +1728,16 @@ app.post("/customer-match/upload/:code", express.json({limit: "50mb"}), async fu
       }
     } catch (e) { console.error("[META audience] push error:", e.message); }
 
+    const googleResults = await _googleCustomerMatchUpload(cache).catch(e => ({ error: String(e && e.message || e) }));
+
     return res.status(200).json({
       ok: true,
       records_stored: cache.records.length,
       with_email: Object.keys(cache.by_email_hash).length,
       with_phone: Object.keys(cache.by_phone_hash).length,
       with_savings: cache.records.filter(rr=>rr.savings).length,
-      meta_audience: metaResults
+      meta_audience: metaResults,
+      google_customer_match: googleResults
     });
   } catch (err) {
     console.error("[PCM upload]", err && err.stack || err);
