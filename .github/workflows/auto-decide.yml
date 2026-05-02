@@ -1,0 +1,26 @@
+name: Auto-Decide New Google Leads
+
+on:
+  schedule:
+    - cron: "17 * * * *"   # hourly at :17 (mirrors prior Cowork cadence)
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run? true / false"
+        required: false
+        default: "true"
+
+jobs:
+  decide:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call /auto-decide
+        env:
+          LEAD_INBOUND_CODE: ${{ secrets.LEAD_INBOUND_CODE }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'true' }}
+        run: |
+          curl -fsS --max-time 120 -X POST \
+            "https://bonzo-sync.onrender.com/auto-decide/${LEAD_INBOUND_CODE}?dry_run=${DRY_RUN}&min_age_hours=24&limit=200" \
+            | tee response.json
+          echo ""
+          echo "::notice ::Auto-decide complete (dry_run=${DRY_RUN})"
