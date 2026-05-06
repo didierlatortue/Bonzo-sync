@@ -1893,6 +1893,43 @@ app.post("/auto-decide/:code", express.json({ limit: "1mb" }), async function(re
   }
 });
 
+
+// =========================
+// GOOGLE OAUTH CALLBACK
+// Exchanges authorization code from Render's own server so the refresh token
+// is bound to Render's IP. Visit /oauth2/callback after authorizing.
+// =========================
+app.get("/oauth2/callback", async (req, res) => {
+  const code = req.query.code;
+  if (!code) return res.status(400).send("Missing code parameter");
+  try {
+    const params = new URLSearchParams({
+      code,
+      client_id: process.env.GOOGLE_CLIENT_ID,
+      client_secret: process.env.GOOGLE_CLIENT_SECRET,
+      redirect_uri: "https://bonzo-sync.onrender.com/oauth2/callback",
+      grant_type: "authorization_code",
+    });
+    const r = await fetch("https://oauth2.googleapis.com/token", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: params.toString(),
+    });
+    const j = await r.json();
+    if (!r.ok) return res.status(400).json({ error: j.error, description: j.error_description });
+    res.json({
+      ok: true,
+      refresh_token: j.refresh_token,
+      access_token: j.access_token ? j.access_token.substring(0, 30) + "..." : null,
+      scope: j.scope,
+      note: "Save refresh_token to Render env var GOOGLE_REFRESH_TOKEN then redeploy"
+    });
+  } catch (e) {
+    res.status(500).json({ error: String(e.message) });
+  }
+});
+
+
 app.listen(process.env.PORT || 3000, () => {
   console.log("Server running");
 });
