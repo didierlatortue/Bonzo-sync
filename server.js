@@ -210,9 +210,14 @@ async function bonzoGetAttribution(prospectId, prospect) {
     }
     if (tags && tags.length) {
       const out = {};
+      const b64decode = (s) => { try { return Buffer.from(String(s), "base64").toString("utf8"); } catch (e) { return ""; } };
       for (const t of tags) {
-        const m = String(t).match(/^(gclid|fbclid|utm_source|utm_medium|utm_campaign|utm_term|utm_content):(.+)$/);
-        if (m) out[m[1]] = m[2];
+        // Match "key:value" or "key:b64:base64value" (case-INsensitive match; Bonzo lowercases the prefix)
+        const m = String(t).match(/^(gclid|fbclid|utm_source|utm_medium|utm_campaign|utm_term|utm_content):(b64:)?(.+)$/i);
+        if (m) {
+          const key = m[1].toLowerCase();
+          out[key] = m[2] ? b64decode(m[3]) : m[3];
+        }
       }
       if (out.gclid || out.fbclid || out.utm_source) {
         console.log("[bonzoGetAttribution] tag-based hit for prospect " + prospectId + " keys=" + Object.keys(out).join(","));
@@ -1400,21 +1405,33 @@ async function _coworkHandleInbound(req, res) {
     }
 
     // Cowork 2026-05-11: store gclid/fbclid as Bonzo tags (durable, ride along in webhooks + REST).
-    // Tags are the primary attribution-lookup source for /bonzo/events ARIVE fan-out.
-    // Notes write is kept as a secondary audit trail; we log status so failures are visible.
+    // IMPORTANT: Bonzo lowercases tag values, and gclids are case-sensitive — so we base64-encode
+    // the raw click-ID before storing it. bonzoGetAttribution decodes on read.
+    // Bonzo v3 doesn't support PATCH on /prospects/{id} (405) — must GET + merge + PUT.
     if (prospectId) {
       try {
+        const b64 = (s) => Buffer.from(String(s), "utf8").toString("base64");
         const attrTags = [];
-        if (attr.gclid)  attrTags.push("gclid:"  + attr.gclid);
-        if (attr.fbclid) attrTags.push("fbclid:" + attr.fbclid);
+        if (attr.gclid)  attrTags.push("gclid:b64:"  + b64(attr.gclid));
+        if (attr.fbclid) attrTags.push("fbclid:b64:" + b64(attr.fbclid));
         if (attr.utm_source)   attrTags.push("utm_source:"   + attr.utm_source);
         if (attr.utm_campaign) attrTags.push("utm_campaign:" + attr.utm_campaign);
         if (attrTags.length > 0) {
-          // Merge with existing tags (don't clobber past-client / refinder tags etc.)
-          const cur = existing ? getTagNames(existing.tags) : [];
+          // GET fresh — existing may be stale (we just created/updated via webhook)
+          const fresh = await bonzoGetProspectById(prospectId);
+          const freshP = (fresh.ok && fresh.json) ? fresh.json : (existing || {});
+          const cur = getTagNames(freshP.tags || []);
           const merged = uniqTags(cur.concat(attrTags));
-          const tagRes = await bonzoPatchProspect(prospectId, { tags: merged });
-          console.log("[lead/inbound] tag merge for prospect " + prospectId + " status=" + tagRes.status + " added=" + JSON.stringify(attrTags));
+          // PUT requires the full object; preserve identity fields. Bonzo will keep the rest.
+          const putBody = {
+            email:      freshP.email      || email || undefined,
+            phone:      freshP.phone      || phone || undefined,
+            first_name: freshP.first_name || first_name || undefined,
+            last_name:  freshP.last_name  || last_name || undefined,
+            tags: merged,
+          };
+          const putRes = await bonzoPutProspectFull(prospectId, putBody);
+          console.log("[lead/inbound] tag merge for prospect " + prospectId + " PUT status=" + putRes.status + " added=" + JSON.stringify(attrTags));
         }
       } catch (e) {
         console.warn("[lead/inbound] tag merge error:", e && e.message);
