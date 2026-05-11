@@ -1073,7 +1073,8 @@ function _coworkExtractAttribution(body) {
 
 function _coworkAttributionTags(flat) {
   return {
-    lead_source: flat.lead_source || flat.utm_source || flat.form_name || "website",
+    // Cowork 2026-05-11: form_name wins over utm_source so /purchase pages with utm_source=google still route to Purchase Bonzo webhook
+    lead_source: flat.lead_source || flat.form_name || flat.utm_source || "website",
     gclid: flat.gclid || "",
     fbclid: flat.fbclid || "",
     utm_source: flat.utm_source || "",
@@ -1138,7 +1139,8 @@ async function _coworkHandleInbound(req, res) {
     //   Purchase:   3ec807d03f29ec10046232c3e1a55670
     // Choose based on the (possibly enriched) lead_source.
     const _ls = (attr.lead_source || "").toString();
-    const _isPurchase = /Purchase/i.test(_ls);
+    // Cowork 2026-05-11: match all purchase-style funnels (Purchase, FHA, VA, Jumbo, DSCR all live on Purchase Bonzo webhook)
+    const _isPurchase = /Purchase|FHA Form|VA Form|Jumbo|DSCR/i.test(_ls);
     const _whRefi = process.env.BONZO_WEBHOOK_REFINANCE_HASH || "ddb05f5431f315e374231b2597e1da01";
     const _whPurch = process.env.BONZO_WEBHOOK_PURCHASE_HASH || "3ec807d03f29ec10046232c3e1a55670";
     const _whHash = _isPurchase ? _whPurch : _whRefi;
@@ -1928,6 +1930,208 @@ app.get("/oauth2/callback", async (req, res) => {
     res.status(500).json({ error: String(e.message) });
   }
 });
+
+
+
+// === COWORK 2026-05-11: Arive (LOS) integration ===
+// Arive is the loan-origination system at https://api.arive.com.
+// Outbound calls auth via POST /api/auth/login → JWT bearer token (~1hr lifetime).
+// Inbound webhooks from Arive verified via X-API-KEY header.
+//
+// Required env vars (set ARIVE_APP_ID + ARIVE_APP_SECRET_HASH once partner creds arrive):
+//   ARIVE_API_KEY           inbound-webhook verification key (32-char from Settings → API Integrations)
+//   ARIVE_API_BASE          defaults to https://api.arive.com
+//   ARIVE_CLIENT_ID         40-char Client ID
+//   ARIVE_SECRET            64-char Secret Key
+//   ARIVE_APP_ID            PROVIDED BY ARIVE PARTNER PROGRAM
+//   ARIVE_APP_SECRET_HASH   PROVIDED BY ARIVE PARTNER PROGRAM
+//
+// Endpoints we expose:
+//   POST /arive/webhook/:code   (Arive → us — receives event notifications)
+//   POST /arive/subscribe/:code (ops helper — subscribes a webhook on Arive)
+//   GET  /arive/hooks/:code     (ops helper — lists active hooks)
+
+let _ariveToken = { value: null, expiresAt: 0 };
+
+async function _ariveGetToken() {
+  if (_ariveToken.value && Date.now() < _ariveToken.expiresAt) return _ariveToken.value;
+  const base = process.env.ARIVE_API_BASE || "https://api.arive.com";
+  const need = ["ARIVE_CLIENT_ID","ARIVE_SECRET","ARIVE_API_KEY","ARIVE_APP_ID","ARIVE_APP_SECRET_HASH"];
+  const missing = need.filter(k => !process.env[k]);
+  if (missing.length) throw new Error("Arive auth missing env: " + missing.join(","));
+  const body = {
+    clientId:      process.env.ARIVE_CLIENT_ID,
+    secret:        process.env.ARIVE_SECRET,
+    apiKey:        process.env.ARIVE_API_KEY,
+    appId:         process.env.ARIVE_APP_ID,
+    appSecretHash: process.env.ARIVE_APP_SECRET_HASH,
+  };
+  const r = await fetch(base + "/api/auth/login", {
+    method: "POST",
+    headers: { "Content-Type":"application/json", "Accept":"application/json", "X-API-KEY": body.apiKey, "User-Agent":"Mozilla/5.0 bonzo-sync arive" },
+    body: JSON.stringify(body),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error("Arive login " + r.status + ": " + JSON.stringify(j));
+  _ariveToken.value = j.AccessToken;
+  _ariveToken.expiresAt = Date.now() + (Number(j.ExpiresIn || 3600) - 60) * 1000;
+  console.log("[arive] token refreshed, expires in", j.ExpiresIn, "s");
+  return _ariveToken.value;
+}
+
+async function _ariveFetch(method, path, payload) {
+  const base = process.env.ARIVE_API_BASE || "https://api.arive.com";
+  async function _do(token) {
+    return fetch(base + path, {
+      method,
+      headers: {
+        "Authorization": "Bearer " + token,
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-API-KEY": process.env.ARIVE_API_KEY,
+        "User-Agent": "Mozilla/5.0 bonzo-sync arive",
+      },
+      body: payload ? JSON.stringify(payload) : undefined,
+    });
+  }
+  let r = await _do(await _ariveGetToken());
+  if (r.status === 401) {
+    _ariveToken = { value: null, expiresAt: 0 };
+    r = await _do(await _ariveGetToken());
+  }
+  let body = null;
+  try { body = await r.json(); } catch { try { body = await r.text(); } catch {} }
+  return { status: r.status, ok: r.ok, body };
+}
+
+// Inbound: Arive posts events here when loans/leads change.
+// Path-based code + X-API-KEY header — both must match.
+app.post("/arive/webhook/:code", async (req, res) => {
+  if (req.params.code !== process.env.LEAD_INBOUND_CODE) return res.status(401).send("Unauthorized (path)");
+  // Path code (LEAD_INBOUND_CODE) is primary auth. X-API-KEY header is optional defense-in-depth:
+  //   - If a key was sent AND we have ARIVE_API_KEY configured, the values must match.
+  //   - If no key was sent, that's fine (Zapier doesn't send custom headers by default).
+  const sentKey = req.header("x-api-key") || req.header("X-API-KEY");
+  if (sentKey && process.env.ARIVE_API_KEY && sentKey !== process.env.ARIVE_API_KEY) {
+    console.warn("[arive/webhook] X-API-KEY mismatch — got", sentKey.slice(0,6)+"…");
+    return res.status(401).send("Unauthorized (api key)");
+  }
+  const body = req.body || {};
+  // Spec doesn't pin exact payload field names — accept multiple casings
+  const event  = String(body.Event || body.event || body.EventType || "").toUpperCase();
+  const loanId = body.LoanId || body.loanId || body.LoanID || null;
+  const leadId = body.LeadId || body.leadId || body.LeadID || null;
+  console.log("[arive/webhook] event=" + event + " loanId=" + loanId + " leadId=" + leadId);
+
+  // ACK fast; process async
+  res.status(200).json({ ok: true, queued: event });
+  setImmediate(async () => {
+    try {
+      switch (event) {
+        case "LEAD_CREATED":
+        case "LEAD_UPDATED":
+          await _ariveOnLead(event, leadId, body); break;
+        case "LOAN_APP_SUBMITTED":
+          await _ariveOnLoanAppSubmitted(loanId); break;   // PRIMARY bid signal
+        case "LOAN_CREATED":
+          await _ariveOnLoanCreated(loanId); break;
+        case "LOAN_STAGE_CHANGED":
+          await _ariveOnLoanStageChanged(loanId); break;
+        case "LOAN_DATE_CHANGED":
+          await _ariveOnLoanDateChanged(loanId); break;
+        default:
+          console.log("[arive/webhook] unhandled event:", event);
+      }
+    } catch (e) {
+      console.error("[arive/webhook] handler error for", event + ":", e && e.stack || e);
+    }
+  });
+});
+
+// Lead handler — tolerant of both shapes:
+//   (a) Arive-direct webhook: {Event, LeadId} → we call back to /api/leads/{id} for borrower data
+//   (b) Zapier-bridge: full borrower fields already in payload (first_name, email, phone, ...)
+async function _ariveOnLead(event, leadId, rawBody) {
+  // Try payload-inline first (Zapier shape)
+  let b = null;
+  if (rawBody && typeof rawBody === "object") {
+    const flat = rawBody;
+    const inlineEmail = flat.email || flat.Email || flat.borrower_email || flat["Borrower Email"];
+    const inlinePhone = flat.phone || flat.Phone || flat.mobile_phone || flat["Mobile Phone"];
+    if (inlineEmail || inlinePhone) {
+      b = {
+        FirstName: flat.first_name || flat.FirstName || flat["First Name"] || "",
+        LastName:  flat.last_name  || flat.LastName  || flat["Last Name"]  || "",
+        Email:     inlineEmail || "",
+        Phone:     inlinePhone || "",
+      };
+      console.log("[arive/lead] using inline payload data (Zapier-bridge mode), email=" + (inlineEmail || "(none)"));
+    }
+  }
+  // Fall back to Arive API fetch if we have a leadId but no inline data
+  if (!b && leadId) {
+    const r = await _ariveFetch("GET", "/api/leads/" + leadId);
+    if (!r.ok) { console.error("[arive/lead] fetch fail", r.status, r.body); return; }
+    const lead = r.body || {};
+    b = (lead.Borrowers && lead.Borrowers[0]) || lead.Borrower || lead.borrower || {};
+  }
+  if (!b) { console.warn("[arive/lead] no payload data and no leadId to fetch"); return; }
+  const email = b.Email || b.email;
+  const phone = b.MobilePhone || b.Phone || b.phone;
+  if (!email && !phone) { console.warn("[arive/lead] no contact info on lead", leadId); return; }
+  // Reuse the same Bonzo-upsert path used by /lead/inbound
+  const fakeReq = {
+    body: {
+      form_name: "ARIVE Lead",
+      fields: {
+        first_name:  { value: b.FirstName || b.firstName || "" },
+        last_name:   { value: b.LastName  || b.lastName  || "" },
+        email:       { value: email || "" },
+        phone:       { value: phone || "" },
+        lead_source: { value: "ARIVE Lead" },
+      },
+    },
+  };
+  const fakeRes = { status: () => fakeRes, json: () => fakeRes, send: () => fakeRes };
+  await _coworkHandleInbound(fakeReq, fakeRes);
+  console.log("[arive/lead] upserted lead", leadId, "into Bonzo");
+}
+
+async function _ariveOnLoanAppSubmitted(loanId) {
+  // 1003 / application submitted — the PRIMARY conversion signal for Google Ads bidding.
+  // TODO once we have GCLID-by-email lookup: upload offline conv 'qualified_application' + Meta CAPI Lead.
+  if (!loanId) return;
+  const r = await _ariveFetch("GET", "/api/loans/" + loanId);
+  if (!r.ok) { console.error("[arive/loan-app] fetch fail", r.status, r.body); return; }
+  const loan = r.body || {};
+  const b = (loan.Borrowers && loan.Borrowers[0]) || {};
+  console.log("[arive/loan-app] LOAN_APP_SUBMITTED loanId=" + loanId + " borrower email=" + (b.Email || "?") + " — fan-out to Google Ads/Meta CAPI pending Postgres gclid lookup");
+}
+
+async function _ariveOnLoanCreated(loanId) { console.log("[arive/loan-created] loanId=" + loanId + " — no-op"); }
+async function _ariveOnLoanStageChanged(loanId) { console.log("[arive/loan-stage] loanId=" + loanId + " — map stage to Bonzo lifecycle pending"); }
+async function _ariveOnLoanDateChanged(loanId) { console.log("[arive/loan-date] loanId=" + loanId + " — check funded date → Google Ads revenue conv pending"); }
+
+// Ops helpers — subscribe / list webhook hooks via JSON POST.
+app.post("/arive/subscribe/:code", express.json(), async (req, res) => {
+  if (req.params.code !== process.env.LEAD_INBOUND_CODE) return res.status(401).send("Unauthorized");
+  const event = (req.body || {}).event;
+  if (!event) return res.status(400).json({ ok: false, error: "missing 'event' field" });
+  const webhookUrl = "https://bonzo-sync.onrender.com/arive/webhook/" + process.env.LEAD_INBOUND_CODE;
+  try {
+    const r = await _ariveFetch("POST", "/api/hooks/subscribe", { WebhookUrl: webhookUrl, Event: event });
+    return res.status(r.status).json(r.body || {});
+  } catch (e) { return res.status(500).json({ ok: false, error: String(e.message || e) }); }
+});
+
+app.get("/arive/hooks/:code", async (req, res) => {
+  if (req.params.code !== process.env.LEAD_INBOUND_CODE) return res.status(401).send("Unauthorized");
+  try {
+    const r = await _ariveFetch("GET", "/api/hooks");
+    return res.status(r.status).json(r.body || {});
+  } catch (e) { return res.status(500).json({ ok: false, error: String(e.message || e) }); }
+});
+// === END COWORK ARIVE PATCH ===
 
 
 app.listen(process.env.PORT || 3000, () => {
