@@ -639,7 +639,36 @@ app.post("/bonzo/events", async (req, res) => {
     if (req.header("x-bonzo-code") !== process.env.BONZO_CODE) return res.status(401).send("Unauthorized");
     const { event, prospect } = req.body;
     console.log("Bonzo event:", event);
-    if (["prospects.created", "prospects.updated"].includes(event)) await upsertGoogleContact(prospect);
+    if (["prospects.created", "prospects.updated"].includes(event)) {
+      await upsertGoogleContact(prospect);
+
+      // === COWORK 2026-05-11: detect ARIVE-source prospects ===
+      // When Zapier creates a Bonzo contact from an Arive event, lead_source will start with "ARIVE".
+      // Phase 2.5 will fire Google Ads offline conversion + Meta CAPI Lead from here.
+      // For now, log the payload shape so we can build the fan-out with confidence.
+      try {
+        const ls = String((prospect && prospect.lead_source) || "");
+        if (/^ARIVE/i.test(ls)) {
+          console.log("[ARIVE-source prospect detected]", JSON.stringify({
+            event,
+            prospect_id: prospect.id,
+            email: prospect.email,
+            phone: prospect.phone,
+            lead_source: ls,
+            custom_fields: prospect.custom_fields || prospect.custom_field_values || null,
+            tags: prospect.tags,
+            keys_top_level: Object.keys(prospect),
+          }));
+          // TODO Phase 2.5: extract gclid/fbclid from prospect.custom_fields or look up by email
+          // in Postgres cache, then POST to /google-ads/upload-conversion (which mirrors to Meta CAPI).
+          // Conversion-action ID switches by lead_source variant:
+          //   "ARIVE Application" -> GOOGLE_ADS_QUALIFIED_APPLICATION_CONV_ID (NEW env var, set up later)
+          //   "ARIVE Funded"      -> GOOGLE_ADS_FUNDED_LOAN_CONV_ID (already exists)
+        }
+      } catch (e) {
+        console.error("[ARIVE-detect] non-fatal:", e && e.message);
+      }
+    }
     res.status(200).json({ ok: true });
   } catch (err) {
     console.error("Webhook error:", err);
