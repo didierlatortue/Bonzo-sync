@@ -188,6 +188,35 @@ async function bonzoGetProspectById(id) {
   return out;
 }
 
+// === COWORK 2026-05-11: read attribution (gclid/fbclid/utm) from Bonzo prospect notes ===
+// /lead/inbound writes a note prefixed "Cowork attribution capture:" with JSON.
+// Returns {gclid, fbclid, utm_source, utm_medium, utm_campaign, utm_term, utm_content, landing_page}
+// or {} if no matching note found.
+async function bonzoGetAttribution(prospectId) {
+  try {
+    const out = await bonzoFetch("/prospects/" + encodeURIComponent(prospectId) + "/notes?per_page=50", { method: "GET" });
+    if (!out.ok) return {};
+    const list = (out.json && (out.json.data || out.json)) || [];
+    if (!Array.isArray(list)) return {};
+    // Find most recent "Cowork attribution capture" note
+    for (const n of list) {
+      const body = (n && (n.note || n.body || n.content || n.text)) || "";
+      const m = String(body).match(/Cowork attribution capture:\s*([\s\S]+)$/);
+      if (m) {
+        try {
+          const obj = JSON.parse(m[1]);
+          // Sanity: at least one attribution key present
+          if (obj && (obj.gclid || obj.fbclid || obj.utm_source || obj.lead_source)) return obj;
+        } catch (e) { /* not JSON, skip */ }
+      }
+    }
+    return {};
+  } catch (e) {
+    console.warn("[bonzoGetAttribution] error:", e && e.message);
+    return {};
+  }
+}
+
 // --- PATCH-first updater (fixes your “PUT overwrote fields” issue) ---
 function sanitizePatch(patch) {
   const p = Object.assign({}, patch || {});
@@ -675,12 +704,67 @@ app.post("/bonzo/events", async (req, res) => {
             custom: prospect.custom,
             mortgage_loan_amount: prospect.mortgage && prospect.mortgage.loan_amount,
           }));
-          // TODO Phase 2.5: look up gclid by prospect.email in Bonzo notes/custom fields
-          // (originally captured by /lead/inbound when the form submitted), then POST to
-          // /google-ads/upload-conversion (which mirrors to Meta CAPI internally).
-          // Conversion-action ID switches by kind:
-          //   ARIVE_APPLICATION → GOOGLE_ADS_QUALIFIED_APPLICATION_CONV_ID (NEW env, TBD)
-          //   ARIVE_FUNDED      → GOOGLE_ADS_FUNDED_LOAN_CONV_ID (already exists)
+          // Phase 2.5: fan out to Google Ads offline conv + Meta CAPI
+          // Look up gclid from the original /lead/inbound attribution note (form submission)
+          setImmediate(async () => {
+            try {
+              const attr = await bonzoGetAttribution(prospect.id);
+              const gclid = attr.gclid || "";
+              if (!gclid) {
+                console.log("[ARIVE-fanout] no gclid for prospect " + prospect.id + " (no prior form submission attribution found) — skipping Google Ads conv");
+                return; // Without gclid, uploadClickConversions has nothing to attribute against
+              }
+              // Pick conv ID + value + Meta event name by kind
+              let convId, value, metaEvent;
+              if (kind === "ARIVE_APPLICATION") {
+                convId = process.env.GOOGLE_ADS_QUALIFIED_APPLICATION_CONV_ID;
+                value = 50;  // default placeholder value for a qualified application
+                metaEvent = "Lead";
+              } else if (kind === "ARIVE_FUNDED") {
+                convId = process.env.GOOGLE_ADS_FUNDED_LOAN_CONV_ID;
+                value = (prospect.mortgage && prospect.mortgage.loan_amount) ? Number(prospect.mortgage.loan_amount) : 250000;
+                metaEvent = "Purchase";
+              } else {
+                console.log("[ARIVE-fanout] " + kind + " — no conv mapping, skipping");
+                return;
+              }
+              if (!convId) {
+                console.warn("[ARIVE-fanout] missing conv env var for kind=" + kind);
+                return;
+              }
+              // Call our own /google-ads/upload-conversion handler synthetically
+              const fakeReq = {
+                params: { code: process.env.LEAD_INBOUND_CODE },
+                headers: {},
+                header: () => null,
+                body: {
+                  gclid: gclid,
+                  fbclid: attr.fbclid || "",
+                  email: prospect.email,
+                  phone: prospect.phone,
+                  conversion_action_id: convId,
+                  value: value,
+                  currency: "USD",
+                  order_id: "arive-" + prospect.id + "-" + kind + "-" + Date.now(),
+                  meta_event_name: metaEvent,
+                }
+              };
+              let captured = null;
+              const fakeRes = {
+                status: function(c) { this.code = c; return this; },
+                json: function(j) { captured = j; return this; },
+                send: function() { return this; },
+              };
+              await _coworkHandleAdsUpload(fakeReq, fakeRes);
+              console.log("[ARIVE-fanout] " + kind + " prospect=" + prospect.id +
+                " gclid=" + gclid.slice(0,8) + "… conv=" + convId +
+                " ok=" + (captured && captured.ok) +
+                " google_http=" + (captured && captured.http) +
+                " meta_status=" + (captured && captured.meta_capi && captured.meta_capi.status));
+            } catch (e) {
+              console.error("[ARIVE-fanout] error for prospect " + prospect.id + ":", e && e.stack || e);
+            }
+          });
         }
       } catch (e) {
         console.error("[ARIVE-detect] non-fatal:", e && e.message);
@@ -1537,7 +1621,10 @@ async function _coworkHandleAdsUpload(req, res) {
       const META_TOKEN = process.env.META_ACCESS_TOKEN;
       const META_PIXEL = process.env.META_PIXEL_ID || "1879445049445130";
       if (META_TOKEN && META_PIXEL) {
-        const evtName = (b.past_client === true || b.past_client === "true" || b.past_client === 1) ? "FundedLoanPastClient" : "FundedLoan";
+        // Cowork 2026-05-11: allow callers to override the Meta event_name (ARIVE flows use "Lead"/"Purchase")
+        const evtName = b.meta_event_name
+          ? String(b.meta_event_name)
+          : ((b.past_client === true || b.past_client === "true" || b.past_client === 1) ? "FundedLoanPastClient" : "FundedLoan");
         const user_data = {};
         if (b.email) user_data.em = [_coworkSha256Hex(b.email)];
         if (b.phone) user_data.ph = [_coworkSha256Hex(String(b.phone).replace(/\D/g,""))];
