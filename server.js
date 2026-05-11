@@ -192,27 +192,58 @@ async function bonzoGetProspectById(id) {
 // /lead/inbound writes a note prefixed "Cowork attribution capture:" with JSON.
 // Returns {gclid, fbclid, utm_source, utm_medium, utm_campaign, utm_term, utm_content, landing_page}
 // or {} if no matching note found.
-async function bonzoGetAttribution(prospectId) {
+// Read attribution (gclid/fbclid/utm) from a Bonzo prospect.
+// Source priority: 1) prospect.tags (set by /lead/inbound as "gclid:VALUE" etc.),
+//                  2) prospect notes scan (legacy audit trail), if no tags found.
+// Pass the prospect object if you already have it (avoids one API call).
+async function bonzoGetAttribution(prospectId, prospect) {
+  // 1. Tag-based lookup (preferred — no extra API call needed)
+  try {
+    let tags = null;
+    if (prospect && Array.isArray(prospect.tags)) {
+      tags = getTagNames(prospect.tags);
+    } else {
+      const fetched = await bonzoGetProspectById(prospectId);
+      if (fetched.ok && fetched.json && Array.isArray(fetched.json.tags)) {
+        tags = getTagNames(fetched.json.tags);
+      }
+    }
+    if (tags && tags.length) {
+      const out = {};
+      for (const t of tags) {
+        const m = String(t).match(/^(gclid|fbclid|utm_source|utm_medium|utm_campaign|utm_term|utm_content):(.+)$/);
+        if (m) out[m[1]] = m[2];
+      }
+      if (out.gclid || out.fbclid || out.utm_source) {
+        console.log("[bonzoGetAttribution] tag-based hit for prospect " + prospectId + " keys=" + Object.keys(out).join(","));
+        return out;
+      }
+    }
+  } catch (e) {
+    console.warn("[bonzoGetAttribution] tag lookup error:", e && e.message);
+  }
+  // 2. Notes fallback (legacy)
   try {
     const out = await bonzoFetch("/prospects/" + encodeURIComponent(prospectId) + "/notes?per_page=50", { method: "GET" });
     if (!out.ok) return {};
     const list = (out.json && (out.json.data || out.json)) || [];
     if (!Array.isArray(list)) return {};
-    // Find most recent "Cowork attribution capture" note
     for (const n of list) {
       const body = (n && (n.note || n.body || n.content || n.text)) || "";
       const m = String(body).match(/Cowork attribution capture:\s*([\s\S]+)$/);
       if (m) {
         try {
           const obj = JSON.parse(m[1]);
-          // Sanity: at least one attribution key present
-          if (obj && (obj.gclid || obj.fbclid || obj.utm_source || obj.lead_source)) return obj;
+          if (obj && (obj.gclid || obj.fbclid || obj.utm_source || obj.lead_source)) {
+            console.log("[bonzoGetAttribution] notes-based hit for prospect " + prospectId);
+            return obj;
+          }
         } catch (e) { /* not JSON, skip */ }
       }
     }
     return {};
   } catch (e) {
-    console.warn("[bonzoGetAttribution] error:", e && e.message);
+    console.warn("[bonzoGetAttribution] notes lookup error:", e && e.message);
     return {};
   }
 }
@@ -708,7 +739,7 @@ app.post("/bonzo/events", async (req, res) => {
           // Look up gclid from the original /lead/inbound attribution note (form submission)
           setImmediate(async () => {
             try {
-              const attr = await bonzoGetAttribution(prospect.id);
+              const attr = await bonzoGetAttribution(prospect.id, prospect);
               const gclid = attr.gclid || "";
               if (!gclid) {
                 console.log("[ARIVE-fanout] no gclid for prospect " + prospect.id + " (no prior form submission attribution found) — skipping Google Ads conv");
@@ -1368,16 +1399,39 @@ async function _coworkHandleInbound(req, res) {
       }
     }
 
-    // Also leave a note for safekeeping (audit trail)
+    // Cowork 2026-05-11: store gclid/fbclid as Bonzo tags (durable, ride along in webhooks + REST).
+    // Tags are the primary attribution-lookup source for /bonzo/events ARIVE fan-out.
+    // Notes write is kept as a secondary audit trail; we log status so failures are visible.
     if (prospectId) {
       try {
+        const attrTags = [];
+        if (attr.gclid)  attrTags.push("gclid:"  + attr.gclid);
+        if (attr.fbclid) attrTags.push("fbclid:" + attr.fbclid);
+        if (attr.utm_source)   attrTags.push("utm_source:"   + attr.utm_source);
+        if (attr.utm_campaign) attrTags.push("utm_campaign:" + attr.utm_campaign);
+        if (attrTags.length > 0) {
+          // Merge with existing tags (don't clobber past-client / refinder tags etc.)
+          const cur = existing ? getTagNames(existing.tags) : [];
+          const merged = uniqTags(cur.concat(attrTags));
+          const tagRes = await bonzoPatchProspect(prospectId, { tags: merged });
+          console.log("[lead/inbound] tag merge for prospect " + prospectId + " status=" + tagRes.status + " added=" + JSON.stringify(attrTags));
+        }
+      } catch (e) {
+        console.warn("[lead/inbound] tag merge error:", e && e.message);
+      }
+      // Audit-trail note (separate try; failure is non-fatal)
+      try {
         const noteBody = "Cowork attribution capture:\n" + JSON.stringify(attr, null, 2);
-        await fetch(`${bonzoBase}/prospects/${prospectId}/notes`, {
+        const nr = await fetch(`${bonzoBase}/prospects/${prospectId}/notes`, {
           method: "POST",
           headers,
           body: JSON.stringify({ note: noteBody }),
         });
-      } catch (e) { /* ignore */ }
+        if (!nr.ok) {
+          const nt = await nr.text();
+          console.warn("[lead/inbound] note POST failed " + nr.status + ": " + nt.slice(0, 200));
+        }
+      } catch (e) { console.warn("[lead/inbound] note POST exception:", e && e.message); }
     }
 
     return res.json({
