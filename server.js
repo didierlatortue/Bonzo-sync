@@ -642,28 +642,45 @@ app.post("/bonzo/events", async (req, res) => {
     if (["prospects.created", "prospects.updated"].includes(event)) {
       await upsertGoogleContact(prospect);
 
-      // === COWORK 2026-05-11: detect ARIVE-source prospects ===
-      // When Zapier creates a Bonzo contact from an Arive event, lead_source will start with "ARIVE".
-      // Phase 2.5 will fire Google Ads offline conversion + Meta CAPI Lead from here.
-      // For now, log the payload shape so we can build the fan-out with confidence.
+      // === COWORK 2026-05-11: detect ARIVE-driven prospects via pipeline routing ===
+      // The Zapier "Create Prospect in Pipeline Stage" action does NOT expose a lead_source
+      // field — Bonzo's "Google Ads Lead to Loan" pipeline (id 44539) is the signal that the
+      // prospect came via the ARIVE flow. Stage names tell us which event:
+      //   "Application Completed*"   → 1003 submitted, fire qualified_application conv
+      //   "Funded*"                  → funded loan, fire funded_loan conv (revenue uplift)
+      // Phase 2.5 will read gclid (from prior /lead/inbound form submission, looked up by email)
+      // and fire Google Ads offline conv + Meta CAPI from here.
       try {
-        const ls = String((prospect && prospect.lead_source) || "");
-        if (/^ARIVE/i.test(ls)) {
+        const pipeline = prospect && prospect.pipeline || {};
+        const stage    = prospect && prospect.pipeline_stage || {};
+        const isAriveLoanPipeline =
+          pipeline.id === 44539 ||
+          /Google Ads Lead to Loan/i.test(pipeline.name || "");
+        if (isAriveLoanPipeline) {
+          const stageName = String(stage.name || "");
+          let kind = "ARIVE_UNKNOWN";
+          if (/Application\s*Completed/i.test(stageName)) kind = "ARIVE_APPLICATION";
+          else if (/Funded/i.test(stageName))              kind = "ARIVE_FUNDED";
+          else if (/Approved|CTC|Clear\s*to\s*Close/i.test(stageName)) kind = "ARIVE_APPROVED";
           console.log("[ARIVE-source prospect detected]", JSON.stringify({
+            kind,
             event,
             prospect_id: prospect.id,
             email: prospect.email,
             phone: prospect.phone,
-            lead_source: ls,
-            custom_fields: prospect.custom_fields || prospect.custom_field_values || null,
+            source_field: prospect.source,
+            pipeline: pipeline,
+            pipeline_stage: stage,
             tags: prospect.tags,
-            keys_top_level: Object.keys(prospect),
+            custom: prospect.custom,
+            mortgage_loan_amount: prospect.mortgage && prospect.mortgage.loan_amount,
           }));
-          // TODO Phase 2.5: extract gclid/fbclid from prospect.custom_fields or look up by email
-          // in Postgres cache, then POST to /google-ads/upload-conversion (which mirrors to Meta CAPI).
-          // Conversion-action ID switches by lead_source variant:
-          //   "ARIVE Application" -> GOOGLE_ADS_QUALIFIED_APPLICATION_CONV_ID (NEW env var, set up later)
-          //   "ARIVE Funded"      -> GOOGLE_ADS_FUNDED_LOAN_CONV_ID (already exists)
+          // TODO Phase 2.5: look up gclid by prospect.email in Bonzo notes/custom fields
+          // (originally captured by /lead/inbound when the form submitted), then POST to
+          // /google-ads/upload-conversion (which mirrors to Meta CAPI internally).
+          // Conversion-action ID switches by kind:
+          //   ARIVE_APPLICATION → GOOGLE_ADS_QUALIFIED_APPLICATION_CONV_ID (NEW env, TBD)
+          //   ARIVE_FUNDED      → GOOGLE_ADS_FUNDED_LOAN_CONV_ID (already exists)
         }
       } catch (e) {
         console.error("[ARIVE-detect] non-fatal:", e && e.message);
