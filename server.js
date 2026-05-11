@@ -210,13 +210,15 @@ async function bonzoGetAttribution(prospectId, prospect) {
     }
     if (tags && tags.length) {
       const out = {};
-      const b64decode = (s) => { try { return Buffer.from(String(s), "base64").toString("utf8"); } catch (e) { return ""; } };
+      const hexdecode = (s) => { try { return Buffer.from(String(s), "hex").toString("utf8"); } catch (e) { return ""; } };
       for (const t of tags) {
-        // Match "key:value" or "key:b64:base64value" (case-INsensitive match; Bonzo lowercases the prefix)
-        const m = String(t).match(/^(gclid|fbclid|utm_source|utm_medium|utm_campaign|utm_term|utm_content):(b64:)?(.+)$/i);
+        // Match "key:value" or "key:hex:hexvalue".
+        // Bonzo lowercases tag values; gclids are case-sensitive — so we hex-encode them.
+        // Hex output is [0-9a-f], already lowercase, so survives Bonzo's normalization.
+        const m = String(t).match(/^(gclid|fbclid|utm_source|utm_medium|utm_campaign|utm_term|utm_content):(hex:)?(.+)$/i);
         if (m) {
           const key = m[1].toLowerCase();
-          out[key] = m[2] ? b64decode(m[3]) : m[3];
+          out[key] = m[2] ? hexdecode(m[3]) : m[3];
         }
       }
       if (out.gclid || out.fbclid || out.utm_source) {
@@ -1410,10 +1412,10 @@ async function _coworkHandleInbound(req, res) {
     // Bonzo v3 doesn't support PATCH on /prospects/{id} (405) — must GET + merge + PUT.
     if (prospectId) {
       try {
-        const b64 = (s) => Buffer.from(String(s), "utf8").toString("base64");
+        const hexenc = (s) => Buffer.from(String(s), "utf8").toString("hex");
         const attrTags = [];
-        if (attr.gclid)  attrTags.push("gclid:b64:"  + b64(attr.gclid));
-        if (attr.fbclid) attrTags.push("fbclid:b64:" + b64(attr.fbclid));
+        if (attr.gclid)  attrTags.push("gclid:hex:" + hexenc(attr.gclid));
+        if (attr.fbclid) attrTags.push("fbclid:hex:" + hexenc(attr.fbclid));
         if (attr.utm_source)   attrTags.push("utm_source:"   + attr.utm_source);
         if (attr.utm_campaign) attrTags.push("utm_campaign:" + attr.utm_campaign);
         if (attrTags.length > 0) {
