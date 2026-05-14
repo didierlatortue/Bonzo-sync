@@ -699,6 +699,36 @@ setInterval(function () {
 }, 10 * 60 * 1000);
 
 // =========================
+// COWORK 2026-05-14: GA4 Measurement Protocol helper
+// =========================
+// Fires server-side events to GA4. Requires GA4_MP_API_SECRET in Render env
+// (created in GA4 Admin → Data Streams → Measurement Protocol API secrets).
+// Safe no-op if the secret isn't set — logs a warning and returns { skipped: true }.
+async function postGa4Event(clientId, eventName, params) {
+  const mid = process.env.GA4_MEASUREMENT_ID || "G-W459HY2LVE";
+  const sec = process.env.GA4_MP_API_SECRET;
+  if (!sec) { console.warn("[GA4-MP] skip " + eventName + " — missing GA4_MP_API_SECRET"); return { skipped: true }; }
+  const url = "https://www.google-analytics.com/mp/collect?measurement_id=" + mid +
+              "&api_secret=" + sec;
+  const body = {
+    client_id: String(clientId || "anonymous"),
+    events: [{ name: eventName, params: params || {} }]
+  };
+  try {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    console.log("[GA4-MP] " + eventName + " status=" + r.status + " client_id=" + body.client_id);
+    return { ok: r.ok, status: r.status };
+  } catch (e) {
+    console.error("[GA4-MP] " + eventName + " err:", e && e.message);
+    return { ok: false, error: e && e.message };
+  }
+}
+
+// =========================
 // ROUTES
 // =========================
 app.post("/bonzo/events", async (req, res) => {
@@ -785,6 +815,10 @@ app.post("/bonzo/events", async (req, res) => {
                   currency: "USD",
                   order_id: "arive-" + prospect.id + "-" + kind + "-" + Date.now(),
                   meta_event_name: metaEvent,
+                  // COWORK 2026-05-14: tell _coworkHandleAdsUpload which GA4 event to fire
+                  ga4_event_name: (kind === "ARIVE_APPLICATION") ? "close_convert_lead"
+                                : (kind === "ARIVE_FUNDED")      ? "purchase"
+                                : null,
                 }
               };
               let captured = null;
@@ -806,6 +840,31 @@ app.post("/bonzo/events", async (req, res) => {
         }
       } catch (e) {
         console.error("[ARIVE-detect] non-fatal:", e && e.message);
+      }
+
+      // === COWORK 2026-05-14: Valid Lead tag → GA4 qualify_lead ===
+      // Idempotent: once we fire, we stamp the prospect with "ga4_qualify_fired" tag
+      // so subsequent prospects.updated events for the same prospect don't double-count.
+      try {
+        const _tagNames = getTagNames(prospect && prospect.tags);
+        const _isValidLead   = _tagNames.some(t => /^valid[\s_-]*lead$/i.test(String(t)));
+        const _alreadyFired  = _tagNames.some(t => /^ga4[_-]qualify[_-]fired$/i.test(String(t)));
+        if (_isValidLead && !_alreadyFired) {
+          console.log("[VALID-LEAD] prospect=" + prospect.id + " — firing GA4 qualify_lead");
+          await postGa4Event(prospect.id, "qualify_lead", {
+            prospect_id: String(prospect.id),
+            email: prospect.email || "",
+            phone: prospect.phone || ""
+          });
+          // Stamp sentinel tag (best-effort, never throw)
+          try {
+            await bonzoUpdateProspect(prospect.id, { tags: addTags(_tagNames, ["ga4_qualify_fired"]) });
+          } catch (eStamp) {
+            console.warn("[VALID-LEAD] sentinel stamp failed:", eStamp && eStamp.message);
+          }
+        }
+      } catch (e) {
+        console.error("[VALID-LEAD] non-fatal:", e && e.message);
       }
     }
     res.status(200).json({ ok: true });
@@ -1441,10 +1500,11 @@ async function _coworkHandleInbound(req, res) {
       // Audit-trail note (separate try; failure is non-fatal)
       try {
         const noteBody = "Cowork attribution capture:\n" + JSON.stringify(attr, null, 2);
+        // COWORK 2026-05-14: Bonzo's /notes endpoint requires 'content', not 'note' (was 422).
         const nr = await fetch(`${bonzoBase}/prospects/${prospectId}/notes`, {
           method: "POST",
           headers,
-          body: JSON.stringify({ note: noteBody }),
+          body: JSON.stringify({ content: noteBody }),
         });
         if (!nr.ok) {
           const nt = await nr.text();
@@ -1722,13 +1782,36 @@ async function _coworkHandleAdsUpload(req, res) {
       }
     } catch (mexc) { metaCapi = { error: mexc.message }; console.error("[META CAPI]", mexc.message); }
 
+    // === COWORK 2026-05-14: Mirror to GA4 via Measurement Protocol ===
+    // Default to "purchase" (funded loan). ARIVE_APPLICATION callers override with "close_convert_lead".
+    // Set ga4_event_name=null in the request body to skip GA4 push entirely.
+    let ga4 = null;
+    try {
+      const ga4Name = (typeof b.ga4_event_name !== "undefined") ? b.ga4_event_name : "purchase";
+      if (ga4Name) {
+        const clientId = (b.email && String(b.email).trim()) || orderId;
+        ga4 = await postGa4Event(clientId, ga4Name, {
+          value: value,
+          currency: currency,
+          transaction_id: orderId,
+          gclid: gclid || ""
+        });
+      } else {
+        ga4 = { skipped: true, reason: "ga4_event_name=null" };
+      }
+    } catch (ga4exc) {
+      ga4 = { error: ga4exc.message };
+      console.error("[GA4-MP] handler err:", ga4exc.message);
+    }
+
     return res.status(r.ok ? 200 : 502).json({
       ok: r.ok,
       http: r.status,
       conversion_action_id: _convId,
       sent: { gclid, value, currency, conversion_time: ct, order_id: orderId },
       google: parsed,
-      meta_capi: metaCapi
+      meta_capi: metaCapi,
+      ga4: ga4
     });
   } catch (e) {
     return res.status(500).json({ ok: false, error: String(e && e.message || e) });
