@@ -1845,10 +1845,12 @@ async function _pgGetPool() {
   if (!process.env.DATABASE_URL) return null;
   const pgmod = await import("pg");
   const Pool = pgmod.Pool || (pgmod.default && pgmod.default.Pool);
-  const isExternal = /oregon-postgres\.render\.com/.test(process.env.DATABASE_URL);
+  // SSL: always enable for non-local DBs (Render, Neon, Supabase, etc. all require it).
+  const _dbUrl = process.env.DATABASE_URL;
+  const _isLocal = /(@|\/)(localhost|127\.0\.0\.1)/.test(_dbUrl || "");
   _pgPool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: isExternal ? { rejectUnauthorized: false } : false,
+    connectionString: _dbUrl,
+    ssl: _isLocal ? false : { rejectUnauthorized: false },
     max: 5,
   });
   await _pgPool.query(`CREATE TABLE IF NOT EXISTS past_clients (
