@@ -1314,14 +1314,39 @@ function _coworkAttributionTags(flat) {
   };
 }
 
-async function _coworkHandleInbound(req, res) {
+function _coworkHandleInbound(req, res) {
+  // Cowork 2026-06-01: ACK fast (<100ms) so Elementor's 5s wp_remote_post doesn't time out.
+  // The Bonzo upsert + tag merge + note POST chain still runs — just detached.
   try {
-    const flat = _coworkExtractAttribution(req.body);
+    const flat = _coworkExtractAttribution(req.body || {});
     const email = (flat.email || "").toString().trim();
     const phone = (flat.phone || flat.phone_number || "").toString().trim();
     if (!email && !phone) {
       return res.status(400).json({ ok: false, error: "email or phone required" });
     }
+    res.json({ ok: true, queued: true, received_at: new Date().toISOString() });
+    setImmediate(() => {
+      _coworkHandleInboundWork(req, flat).catch(e =>
+        console.error("[lead/inbound] async work error:", e && e.stack || e));
+    });
+  } catch (e) {
+    console.error("[lead/inbound] sync ack error:", e && e.stack || e);
+    if (!res.headersSent) {
+      return res.status(500).json({ ok: false, error: e.message || String(e) });
+    }
+  }
+}
+
+async function _coworkHandleInboundWork(req, preFlat) {
+  const res = { /* no-op stub: response already sent by sync wrapper */
+    json: () => {},
+    status: () => ({ json: () => {}, send: () => {} }),
+    send: () => {},
+  };
+  try {
+    const flat = preFlat || _coworkExtractAttribution(req.body);
+    const email = (flat.email || "").toString().trim();
+    const phone = (flat.phone || flat.phone_number || "").toString().trim();
     const attr = _coworkAttributionTags(flat);
     const first_name = flat.first_name || "";
     const last_name = flat.last_name || "";
@@ -1390,6 +1415,16 @@ async function _coworkHandleInbound(req, res) {
       utm_content: attr.utm_content || undefined,
       landing_page: attr.landing_page || undefined,
       page_referrer: attr.page_referrer || undefined,
+      // Cowork 2026-06-01: widened purchase-form fields (were silently dropped)
+      purchase_price: flat.purchase_price || undefined,
+      credit_score: flat.credit_score || undefined,
+      loan_program: flat.loan_program || undefined,
+      va_eligible: flat.va_eligible || undefined,
+      amortization_term: flat.amortization_term || undefined,
+      down_payment: flat.down_payment || undefined,
+      current_step: flat.current_step || undefined,
+      property_use: flat.property_use || undefined,
+      property_city: flat.property_city || undefined,
       // Past-client enrichment (when match fired)
       loan_amount: flat.loan_amount || undefined,
       interest_rate: flat.interest_rate || undefined,
