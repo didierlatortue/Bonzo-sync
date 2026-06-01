@@ -1398,12 +1398,17 @@ async function _coworkHandleInboundWork(req, preFlat) {
     const _whHash = _isPurchase ? _whPurch : _whRefi;
     const _whUrl = "https://app.getbonzo.com/api/webhook/" + _whHash;
 
-    // Forwarded body — flat keys mapped via webhook field-mapping config.
-    // Includes enriched fields from past-client matching.
+    // Cowork 2026-06-01 (#2): passthrough forwardBody. Bonzo's webhook field
+    // mapping is the real gate — any key not mapped on Bonzo's side is silently
+    // ignored. So we pass through all flat form keys and override only the
+    // normalized/derived values. New form fields "just work" as long as the
+    // matching Bonzo mapping is configured.
     const forwardBody = {
+      ...flat,
       first_name, last_name,
       email: email || undefined,
       phone: phone || undefined,
+      phone_number: phone || undefined,
       lead_source: attr.lead_source,
       form_name: flat.form_name || attr.lead_source,
       gclid: attr.gclid || undefined,
@@ -1415,28 +1420,6 @@ async function _coworkHandleInboundWork(req, preFlat) {
       utm_content: attr.utm_content || undefined,
       landing_page: attr.landing_page || undefined,
       page_referrer: attr.page_referrer || undefined,
-      // Cowork 2026-06-01: widened purchase-form fields (were silently dropped)
-      purchase_price: flat.purchase_price || undefined,
-      credit_score: flat.credit_score || undefined,
-      loan_program: flat.loan_program || undefined,
-      va_eligible: flat.va_eligible || undefined,
-      amortization_term: flat.amortization_term || undefined,
-      down_payment: flat.down_payment || undefined,
-      current_step: flat.current_step || undefined,
-      property_use: flat.property_use || undefined,
-      property_city: flat.property_city || undefined,
-      // Past-client enrichment (when match fired)
-      loan_amount: flat.loan_amount || undefined,
-      interest_rate: flat.interest_rate || undefined,
-      property_address: flat.property_address || undefined,
-      loan_type: flat.loan_type || undefined,
-      loan_purpose: flat.loan_purpose || undefined,
-      property_state: flat.property_state || undefined,
-      property_zip: flat.property_zip || undefined,
-      estimated_monthly_savings: flat.estimated_monthly_savings,
-      estimated_total_savings: flat.estimated_total_savings,
-      refinder_eligible: flat.refinder_eligible,
-      past_client_match: flat.past_client_match,
     };
 
     let prospectId = null;
