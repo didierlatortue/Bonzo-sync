@@ -1621,6 +1621,131 @@ app.post("/calendly/:code", (req, res) => {
 });
 // === END COWORK CALENDLY PATCH ===
 
+// === COWORK 2026-06-02: /calendly/clientside-attr ===
+// Client-side attribution bridge for Calendly bookings on Basic plan.
+// Page-side: listener on /consultation/ captures utm/gclid from page URL +
+// invitee_uri from Calendly postMessage, POSTs here. We resolve the invitee
+// via Calendly REST (PAT in CALENDLY_PAT env), find the Bonzo prospect by
+// email/phone, then PATCH attribution tags + a Calendly-source note.
+// Why: Basic Calendly plan blocks /webhook_subscriptions, so we can't run
+// the existing /calendly server-webhook path. This recreates the same
+// attribution flow from the client side using the PAT we have.
+async function _coworkResolveCalendlyInvitee(invitee_uri) {
+  const pat = String(process.env.CALENDLY_PAT || "").trim();
+  if (!pat) throw new Error("CALENDLY_PAT env var not set");
+  if (!/^https:\/\/api\.calendly\.com\/scheduled_events\/[^/]+\/invitees\/[^/]+$/.test(invitee_uri || "")) {
+    throw new Error("invitee_uri shape unexpected: " + invitee_uri);
+  }
+  const r = await fetch(invitee_uri, { headers: { Authorization: "Bearer " + pat, Accept: "application/json" } });
+  if (!r.ok) throw new Error("Calendly invitee fetch " + r.status);
+  const j = await r.json();
+  const res = (j && j.resource) || {};
+  return {
+    email: (res.email || "").trim().toLowerCase(),
+    phone: (res.text_reminder_number || "").trim(),
+    first_name: (res.first_name || ((res.name || "").split(" ")[0]) || "").trim(),
+    last_name: (res.last_name || ((res.name || "").split(" ").slice(1).join(" ")) || "").trim(),
+    event_uri: (res.event || ""),
+    cancel_url: (res.cancel_url || ""),
+    reschedule_url: (res.reschedule_url || ""),
+    tracking: (res.tracking || {}),
+  };
+}
+
+async function _coworkHandleCalendlyClientsideAttr(req, res) {
+  try {
+    const body = req.body || {};
+    const inv_uri = String(body.invitee_uri || "").trim();
+    if (!inv_uri) return res.status(400).json({ ok: false, error: "invitee_uri required" });
+
+    const inv = await _coworkResolveCalendlyInvitee(inv_uri);
+    if (!inv.email && !inv.phone) {
+      return res.status(404).json({ ok: false, error: "Calendly invitee has no email or phone", invitee_uri: inv_uri });
+    }
+
+    // Merge UTMs: prefer page-supplied (truthful intent), fall back to Calendly tracking field
+    const utm = {
+      utm_source: body.utm_source || inv.tracking.utm_source || "",
+      utm_medium: body.utm_medium || inv.tracking.utm_medium || "",
+      utm_campaign: body.utm_campaign || inv.tracking.utm_campaign || "",
+      utm_term: body.utm_term || inv.tracking.utm_term || "",
+      utm_content: body.utm_content || inv.tracking.utm_content || "",
+      gclid: body.gclid || inv.tracking.salesforce_uuid || "",
+      fbclid: body.fbclid || "",
+    };
+
+    // Find Bonzo prospect by email then phone
+    const bonzoBase = process.env.BONZO_BASE_URL || "https://app.getbonzo.com/api";
+    const bonzoToken = process.env.BONZO_TOKEN || process.env.BONZO_API_KEY;
+    const headers = {
+      "Authorization": "Bearer " + bonzoToken,
+      "Content-Type": "application/json",
+      "Accept": "application/json",
+      "User-Agent": "Mozilla/5.0 (compatible) bonzo-sync",
+    };
+    function _norm(s) { return (s || "").toString().trim().toLowerCase(); }
+    function _normPhone(s) { return (s || "").toString().replace(/[^0-9]/g, "").replace(/^1(\d{10})$/, "$1"); }
+    async function _findBy(term, kind) {
+      const r = await fetch(bonzoBase + "/prospects?search=" + encodeURIComponent(term) + "&per_page=10", { headers });
+      if (!r.ok) return null;
+      const j = await r.json();
+      const data = Array.isArray(j.data) ? j.data : [];
+      const want = _norm(term);
+      const wantPhone = _normPhone(term);
+      for (const p of data) {
+        if (kind === "email" && _norm(p.email) === want) return p;
+        if (kind === "phone" && _normPhone(p.phone) === wantPhone) return p;
+      }
+      return null;
+    }
+    let prospect = null;
+    if (inv.email) prospect = await _findBy(inv.email, "email");
+    if (!prospect && inv.phone) prospect = await _findBy(inv.phone, "phone");
+
+    if (!prospect) {
+      // Bonzo's native Calendly push handles invitee.created, so the prospect should appear
+      // shortly. Schedule a retry on a short delay before giving up.
+      await new Promise(r => setTimeout(r, 4000));
+      if (inv.email) prospect = await _findBy(inv.email, "email");
+      if (!prospect && inv.phone) prospect = await _findBy(inv.phone, "phone");
+    }
+
+    if (!prospect) {
+      return res.status(202).json({ ok: false, queued_note: "Prospect not found yet (Bonzo native Calendly push may not have completed)", email: inv.email, phone: inv.phone });
+    }
+
+    // Build attribution patch — tags only (Bonzo custom-field mapping varies)
+    const newTags = ["source:calendly", "calendly_consultation"];
+    if (utm.utm_source) newTags.push("utm_source:" + utm.utm_source.slice(0, 40));
+    if (utm.utm_medium) newTags.push("utm_medium:" + utm.utm_medium.slice(0, 40));
+    if (utm.utm_campaign) newTags.push("utm_campaign:" + utm.utm_campaign.slice(0, 40));
+    if (utm.gclid) newTags.push("gclid_present");
+
+    const existingTags = getTagNames(prospect.tags || []);
+    const merged = addTags(existingTags, newTags);
+
+    const patch = {
+      tags: merged,
+      // Always-safe: a few well-known fields that Bonzo accepts on prospect update
+      lead_source: "Calendly Consultation" + (utm.utm_source ? (" (" + utm.utm_source + ")") : ""),
+    };
+
+    const upd = await bonzoUpdateProspect(prospect.id, patch);
+
+    return res.json({ ok: true, prospect_id: prospect.id, tags_added: newTags });
+  } catch (e) {
+    console.error("[clientside-attr] error:", e && e.stack || e);
+    return res.status(500).json({ ok: false, error: e.message || String(e) });
+  }
+}
+
+app.post("/calendly/clientside-attr/:code", express.json({ limit: "256kb" }), (req, res) => {
+  if (req.params.code !== process.env.LEAD_INBOUND_CODE) return res.status(401).send("Unauthorized");
+  return _coworkHandleCalendlyClientsideAttr(req, res);
+});
+// === END COWORK 2026-06-02 ===
+
+
 // === COWORK 2026-04-29: /google-ads/upload-conversion ===
 let _coworkAdsToken = null;
 let _coworkAdsTokenExp = 0;
