@@ -1,0 +1,33 @@
+name: Spam-Call Prospect Cleanup
+
+on:
+  schedule:
+    - cron: "33 * * * *"   # hourly at :33
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run? true / false"
+        required: false
+        default: "false"
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call /spam-cleanup
+        env:
+          LEAD_INBOUND_CODE: ${{ secrets.LEAD_INBOUND_CODE }}
+          DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: |
+          curl -fsS --max-time 120 -X POST \
+            -H "Content-Type: application/json" \
+            -d '{}' \
+            "https://bonzo-sync.onrender.com/spam-cleanup/${LEAD_INBOUND_CODE}?dry_run=${DRY_RUN}" \
+            | tee response.json
+          echo ""
+          # Parse summary fields and emit a GHA notice
+          CC=$(python3 -c "import json; d=json.load(open('response.json')); print(d.get('candidate_count','?'))")
+          DB=$(python3 -c "import json; d=json.load(open('response.json')); print(d.get('deleted_bonzo','?'))")
+          ER=$(python3 -c "import json; d=json.load(open('response.json')); print(d.get('errors','?'))")
+          HS=$(python3 -c "import json; d=json.load(open('response.json')); print(d.get('hard_cap_skipped','?'))")
+          echo "::notice ::Spam cleanup: candidates=${CC} deleted_bonzo=${DB} errors=${ER} hard_cap_skipped=${HS}"
