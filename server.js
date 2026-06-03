@@ -2703,6 +2703,110 @@ app.get("/arive/hooks/:code", async (req, res) => {
 // === END COWORK ARIVE PATCH ===
 
 
+// === COWORK 2026-06-03: Spam-call prospect cleanup ===
+// Deletes Bonzo prospects whose name is just a phone number (incoming
+// spam calls/texts that left no real name). Also removes the matching
+// Google Contact if one exists.
+//
+// Defense:
+//   - Auth: code must equal LEAD_INBOUND_CODE
+//   - dry_run default = true (must explicitly pass ?dry_run=false to delete)
+//   - Hard cap: never delete more than SPAM_CLEANUP_HARD_CAP per run
+//   - Logs every candidate before delete; returns full report
+app.post("/spam-cleanup/:code", express.json({ limit: "1mb" }), async function(req, res) {
+  if (req.params.code !== process.env.LEAD_INBOUND_CODE) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
+  }
+  try {
+    const dryRun = req.query.dry_run !== "false";
+    const HARD_CAP = Math.min(Number(process.env.SPAM_CLEANUP_HARD_CAP || 50), 200);
+    const requestLimit = Math.min(Number(req.query.limit) || 50, HARD_CAP);
+
+    // Pull all prospects, paginated
+    const candidates = [];
+    let page = 1;
+    let lastPage = 1;
+    do {
+      const r = await bonzoFetch("/prospects?per_page=100&page=" + page, { method: "GET" });
+      if (!r || !r.ok || !r.json) {
+        return res.status(502).json({ ok: false, error: "bonzo_list_failed", page: page, status: r && r.status });
+      }
+      const data = r.json.data || [];
+      const meta = r.json.meta || {};
+      lastPage = meta.last_page || 1;
+      for (const p of data) {
+        if (nameLooksLikePhone(p.first_name, p.last_name)) {
+          candidates.push({
+            id: p.id,
+            full_name: (p.full_name || "").trim(),
+            source: p.source || null,
+            status: p.status || null,
+            created_at: p.created_at || null,
+            email: p.email || null,
+            phone: p.phone || null,
+          });
+        }
+      }
+      page++;
+    } while (page <= lastPage);
+
+    // Apply hard cap
+    const toDelete = candidates.slice(0, requestLimit);
+    const skipped = candidates.length - toDelete.length;
+
+    console.log("[spam-cleanup] candidates=" + candidates.length +
+                " will_act=" + toDelete.length + " hard_cap_skipped=" + skipped +
+                " dry_run=" + dryRun);
+
+    const results = [];
+    let deletedBonzo = 0, deletedGoogle = 0, errors = 0;
+
+    if (!dryRun) {
+      for (const c of toDelete) {
+        const r = { id: c.id, name: c.full_name, bonzo_delete: null, google_delete: null };
+        // Bonzo DELETE
+        try {
+          const del = await bonzoFetch("/prospects/" + c.id, { method: "DELETE" });
+          r.bonzo_delete = { ok: del && del.ok, status: del && del.status };
+          if (del && del.ok) deletedBonzo++;
+          else errors++;
+        } catch (e) {
+          r.bonzo_delete = { ok: false, error: e && e.message };
+          errors++;
+        }
+        // Google delete (best-effort)
+        try {
+          const gd = await deleteGoogleContactsForBonzoProspect(c.id, c.email, c.phone);
+          r.google_delete = gd;
+          if (gd && gd.deleted) deletedGoogle += gd.deleted;
+        } catch (e) {
+          r.google_delete = { ok: false, error: e && e.message };
+        }
+        results.push(r);
+      }
+    }
+
+    return res.json({
+      ok: true,
+      dry_run: dryRun,
+      total_scanned_pages: lastPage,
+      candidate_count: candidates.length,
+      acted_on: toDelete.length,
+      hard_cap: HARD_CAP,
+      hard_cap_skipped: skipped,
+      deleted_bonzo: deletedBonzo,
+      deleted_google: deletedGoogle,
+      errors: errors,
+      candidates: dryRun ? candidates : undefined,
+      results: dryRun ? undefined : results,
+    });
+  } catch (err) {
+    console.error("[spam-cleanup] err:", err && err.message);
+    return res.status(500).json({ ok: false, error: err && err.message });
+  }
+});
+
+
 app.listen(process.env.PORT || 3000, () => {
   console.log("Server running");
 });
