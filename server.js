@@ -503,20 +503,131 @@ async function findExistingContact(prospect, accessToken) {
   }
   return null;
 }
+// === COWORK 2026-06-03: Postgres-keyed dedupe helpers (google_contacts cache) ===
+// Bypasses People API searchContacts (~30s–min indexing lag) by caching
+// (bonzo_id -> resource_name, etag) in Neon. See feedback_googlecontacts_searchcontacts_lag.
+async function pgGetGoogleContactByBonzoId(bonzoId) {
+  if (!bonzoId) return null;
+  const pool = await _pgGetPool();
+  if (!pool) return null;
+  try {
+    const { rows } = await pool.query(
+      "SELECT resource_name, etag FROM google_contacts WHERE bonzo_id = $1",
+      [String(bonzoId)]
+    );
+    return rows[0] || null;
+  } catch (e) {
+    console.error("[GC-cache] get failed:", e.message);
+    return null;
+  }
+}
+async function pgUpsertGoogleContactCache(bonzoId, resourceName, email, phoneLast10, etag) {
+  if (!bonzoId || !resourceName) return;
+  const pool = await _pgGetPool();
+  if (!pool) return;
+  try {
+    await pool.query(
+      `INSERT INTO google_contacts (bonzo_id, resource_name, email, phone_last10, etag, updated_at)
+       VALUES ($1,$2,$3,$4,$5, NOW())
+       ON CONFLICT (bonzo_id) DO UPDATE
+         SET resource_name = EXCLUDED.resource_name,
+             email = EXCLUDED.email,
+             phone_last10 = EXCLUDED.phone_last10,
+             etag = EXCLUDED.etag,
+             updated_at = NOW()`,
+      [String(bonzoId), resourceName, email || null, phoneLast10 || null, etag || null]
+    );
+  } catch (e) {
+    console.error("[GC-cache] upsert failed:", e.message);
+  }
+}
+async function pgDeleteGoogleContactCache(bonzoId) {
+  if (!bonzoId) return;
+  const pool = await _pgGetPool();
+  if (!pool) return;
+  try {
+    await pool.query("DELETE FROM google_contacts WHERE bonzo_id = $1", [String(bonzoId)]);
+  } catch (e) {
+    console.error("[GC-cache] delete failed:", e.message);
+  }
+}
+
 async function upsertGoogleContact(prospect) {
   if (nameLooksLikePhone(prospect && prospect.first_name, prospect && prospect.last_name)) return;
   const phoneStored = normalizePhoneForStore(prospect && prospect.phone);
   const phoneDigits = digitsOnly(phoneStored);
   if (!phoneDigits) return;
   const email = normalizeEmail(prospect && prospect.email);
+  const bonzoId = (prospect && prospect.id) ? String(prospect.id) : "";
+  const phoneLast10 = last10Digits(phoneDigits);
   const accessToken = await getGoogleAccessToken();
   const body = {
     names: [{ givenName: (prospect && prospect.first_name) || "", familyName: (prospect && prospect.last_name) || "" }],
     emailAddresses: email ? [{ value: email }] : [],
     phoneNumbers: [{ value: phoneStored || phoneDigits }],
-    biographies: [{ value: "Source: Bonzo | ID: " + ((prospect && prospect.id) || "") }],
+    biographies: [{ value: "Source: Bonzo | ID: " + bonzoId }],
     organizations: [{ name: "Home Loans", title: "Lead" }],
   };
+
+  // === COWORK 2026-06-03: Postgres cache fast path ===
+  // Look up resource_name by bonzo_id. If present, PATCH directly — skips
+  // searchContacts entirely (which has eventual-consistency indexing lag
+  // that produced duplicate contacts under back-to-back Bonzo events).
+  const cached = await pgGetGoogleContactByBonzoId(bonzoId);
+  if (cached && cached.resource_name) {
+    try {
+      const rn = ensurePeopleResourceName(cached.resource_name);
+      const updateUrl =
+        "https://people.googleapis.com/v1/" + rn + ":updateContact" +
+        "?updatePersonFields=names,emailAddresses,phoneNumbers,biographies,organizations";
+      let fastPathDone = false;
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        let etag = (attempt === 1 && cached.etag) ? cached.etag : null;
+        if (!etag) {
+          try { const p = await getPerson(rn, accessToken); etag = p && p.etag; }
+          catch (gpErr) {
+            // 404 from getPerson means the contact was deleted out-of-band
+            if (/404/.test(String(gpErr && gpErr.message))) {
+              await pgDeleteGoogleContactCache(bonzoId);
+              fastPathDone = "fallthrough";
+              break;
+            }
+            throw gpErr;
+          }
+        }
+        const r = await fetch(updateUrl, {
+          method: "PATCH",
+          headers: Object.assign(
+            { Authorization: "Bearer " + accessToken, "Content-Type": "application/json" },
+            etag ? { "If-Match": etag } : {}
+          ),
+          body: JSON.stringify(Object.assign({}, body, { etag })),
+        });
+        const out = await readJsonOrText(r);
+        if (out.ok) {
+          await pgUpsertGoogleContactCache(bonzoId, rn, email, phoneLast10, out.json && out.json.etag);
+          return out.json;
+        }
+        if (out.status === 412 && attempt === 1) continue;
+        if (out.status === 404) {
+          await pgDeleteGoogleContactCache(bonzoId);
+          fastPathDone = "fallthrough";
+          break;
+        }
+        console.warn("[GC-fast-path] PATCH failed status=" + out.status + " — falling through");
+        fastPathDone = "fallthrough";
+        break;
+      }
+      if (fastPathDone !== "fallthrough") {
+        // Shouldn't reach here, but be defensive
+        console.warn("[GC-fast-path] exited unexpectedly — falling through");
+      }
+    } catch (e) {
+      console.warn("[GC-fast-path] threw:", e && e.message, "— falling through");
+    }
+  }
+
+  // === Slow path (legacy) — searchContacts dedupe + create ===
   const found = await findExistingContact(prospect, accessToken);
   if (found && found.resourceName) {
     const person = await getPerson(found.resourceName, accessToken);
@@ -538,7 +649,10 @@ async function upsertGoogleContact(prospect) {
         body: JSON.stringify(Object.assign({}, body, { etag })),
       });
       const out = await readJsonOrText(r);
-      if (out.ok) return out.json;
+      if (out.ok) {
+        await pgUpsertGoogleContactCache(bonzoId, rn, email, phoneLast10, out.json && out.json.etag);
+        return out.json;
+      }
       if (out.status === 412 && attempt === 1) continue;
       throw new Error("updateContact failed: " + out.status);
     }
@@ -550,6 +664,13 @@ async function upsertGoogleContact(prospect) {
   });
   const out = await readJsonOrText(r);
   if (!out.ok) throw new Error("createContact failed: " + out.status);
+  await pgUpsertGoogleContactCache(
+    bonzoId,
+    out.json && out.json.resourceName,
+    email,
+    phoneLast10,
+    out.json && out.json.etag
+  );
   return out.json;
 }
 
@@ -627,6 +748,9 @@ async function deleteGoogleContactsForBonzoProspect(bonzoId, email, phone) {
     await deleteGoogleContact(full.resourceName, accessToken);
     deleted++;
   }
+
+  // COWORK 2026-06-03: clear Postgres cache row so next event re-creates cleanly
+  try { await pgDeleteGoogleContactCache(id); } catch (e) {}
 
   return { ok: true, deleted, checked, searched: uniqCandidates.length, queries };
 }
@@ -2003,6 +2127,17 @@ async function _pgGetPool() {
   )`);
   await _pgPool.query("CREATE INDEX IF NOT EXISTS past_clients_email_hash_idx ON past_clients(email_hash) WHERE email_hash IS NOT NULL");
   await _pgPool.query("CREATE INDEX IF NOT EXISTS past_clients_phone_hash_idx ON past_clients(phone_hash) WHERE phone_hash IS NOT NULL");
+  // === COWORK 2026-06-03: google_contacts cache (bonzo_id -> People API resourceName) ===
+  await _pgPool.query(`CREATE TABLE IF NOT EXISTS google_contacts (
+    bonzo_id TEXT PRIMARY KEY,
+    resource_name TEXT NOT NULL,
+    email TEXT,
+    phone_last10 TEXT,
+    etag TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  )`);
+  await _pgPool.query("CREATE INDEX IF NOT EXISTS google_contacts_phone_idx ON google_contacts(phone_last10) WHERE phone_last10 IS NOT NULL");
+  await _pgPool.query("CREATE INDEX IF NOT EXISTS google_contacts_email_idx ON google_contacts(email) WHERE email IS NOT NULL");
   return _pgPool;
 }
 
