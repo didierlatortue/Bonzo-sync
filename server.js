@@ -960,7 +960,9 @@ app.post("/bonzo/events", async (req, res) => {
                   conversion_action_id: convId,
                   value: value,
                   currency: "USD",
-                  order_id: "arive-" + prospect.id + "-" + kind + "-" + Date.now(),
+                  // Cowork 2026-06-04: deterministic order_id — MANY_PER_CLICK counting dedupes
+                  // ONLY by order_id, so a Bonzo stage re-fire must produce the same id.
+                  order_id: "arive-" + prospect.id + "-" + kind,
                   meta_event_name: metaEvent,
                   // COWORK 2026-05-14: tell _coworkHandleAdsUpload which GA4 event to fire
                   ga4_event_name: (kind === "ARIVE_APPLICATION") ? "close_convert_lead"
