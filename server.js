@@ -3002,6 +3002,8 @@ app.get("/tlc/leads/:code", async (req, res) => {
 });
 
 
+console.log("[TLC] capture routes registered, code_env=" + (process.env.TLC_CAPTURE_CODE ? "set" : "MISSING"));
+
 app.listen(process.env.PORT || 3000, () => {
   console.log("Server running");
 });
