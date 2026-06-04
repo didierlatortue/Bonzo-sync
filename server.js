@@ -931,7 +931,7 @@ app.post("/bonzo/events", async (req, res) => {
               let convId, value, metaEvent;
               if (kind === "ARIVE_APPLICATION") {
                 convId = process.env.GOOGLE_ADS_QUALIFIED_APPLICATION_CONV_ID;
-                value = 50;  // default placeholder value for a qualified application
+                value = 2;   // standard QA conversion value (Didier, 2026-06-04 — was 50)
                 metaEvent = "Lead";
               } else if (kind === "ARIVE_FUNDED") {
                 convId = process.env.GOOGLE_ADS_FUNDED_LOAN_CONV_ID;
