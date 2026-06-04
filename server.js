@@ -2843,6 +2843,165 @@ app.post("/spam-cleanup/:code", express.json({ limit: "1mb" }), async function(r
 });
 
 
+
+// =========================================================
+// TLC (Turtur Luxury Cars) — abandoned-checkout early capture
+// Added 2026-06-04. Receives contact info typed into the HQ Rentals
+// checkout (via GTM tag on turtur-llc.us5.hqrentals.app + turturluxurycars.com),
+// stores in Postgres, appends to Meta Custom Audience, fires Meta CAPI Lead.
+// Auth: :code must match TLC_CAPTURE_CODE env var.
+// Sent as text/plain (simple request, no CORS preflight needed; fire-and-forget).
+// =========================================================
+
+let _tlcTableReady = false;
+async function _tlcEnsureTable(pool) {
+  if (_tlcTableReady) return;
+  await pool.query(`CREATE TABLE IF NOT EXISTS tlc_abandoned_leads (
+    id SERIAL PRIMARY KEY,
+    email TEXT,
+    phone TEXT,
+    first_name TEXT,
+    last_name TEXT,
+    step TEXT,
+    dates TEXT,
+    page_url TEXT,
+    meta_audience_synced BOOLEAN DEFAULT FALSE,
+    meta_capi_synced BOOLEAN DEFAULT FALSE,
+    google_cm_synced BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+  )`);
+  await pool.query("CREATE UNIQUE INDEX IF NOT EXISTS tlc_leads_email_uidx ON tlc_abandoned_leads(email) WHERE email IS NOT NULL");
+  await pool.query("CREATE UNIQUE INDEX IF NOT EXISTS tlc_leads_phone_uidx ON tlc_abandoned_leads(phone) WHERE phone IS NOT NULL");
+  _tlcTableReady = true;
+}
+
+async function _tlcMetaAudienceAppend(email, phone) {
+  const token = process.env.META_TLC_ACCESS_TOKEN;
+  const audId = process.env.META_TLC_ABANDONED_AUDIENCE_ID;
+  if (!token || !audId) return { skipped: "no creds" };
+  const schema = ["EMAIL", "PHONE"];
+  const row = [
+    email ? await sha256Lower(email) : "",
+    phone ? await sha256Lower(phone.replace(/\D/g, "")) : ""
+  ];
+  const payload = { schema: schema, data: [row] };
+  const r = await fetch(`https://graph.facebook.com/v22.0/${audId}/users?access_token=${encodeURIComponent(token)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: "payload=" + encodeURIComponent(JSON.stringify(payload))
+  });
+  const j = await readJsonOrText(r);
+  console.log("[tlc/capture] meta audience append status=" + r.status, JSON.stringify(j.json || j.text).slice(0, 200));
+  return { status: r.status, ok: r.ok };
+}
+
+async function _tlcMetaCapiLead(email, phone, pageUrl) {
+  const token = process.env.META_TLC_ACCESS_TOKEN;
+  const pixel = process.env.META_TLC_PIXEL_ID;
+  if (!token || !pixel) return { skipped: "no creds" };
+  const userData = {};
+  if (email) userData.em = [await sha256Lower(email)];
+  if (phone) userData.ph = [await sha256Lower(phone.replace(/\D/g, ""))];
+  const ev = {
+    data: [{
+      event_name: "Lead",
+      event_time: Math.floor(Date.now() / 1000),
+      action_source: "website",
+      event_source_url: pageUrl || "https://turturluxurycars.com/book-direct/",
+      user_data: userData
+    }]
+  };
+  const r = await fetch(`https://graph.facebook.com/v22.0/${pixel}/events?access_token=${encodeURIComponent(token)}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(ev)
+  });
+  const j = await readJsonOrText(r);
+  console.log("[tlc/capture] meta capi lead status=" + r.status, JSON.stringify(j.json || j.text).slice(0, 200));
+  return { status: r.status, ok: r.ok };
+}
+
+app.post("/tlc/capture/:code", express.text({ type: "*/*", limit: "32kb" }), async (req, res) => {
+  try {
+    if (req.params.code !== process.env.TLC_CAPTURE_CODE) {
+      return res.status(403).json({ ok: false });
+    }
+    let b = {};
+    try { b = typeof req.body === "string" ? JSON.parse(req.body) : (req.body || {}); } catch (e) { return res.status(400).json({ ok: false }); }
+
+    const email = (b.email && /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(b.email).trim())) ? String(b.email).trim().toLowerCase() : null;
+    let phone = b.phone ? String(b.phone).replace(/\D/g, "") : null;
+    if (phone && phone.length < 10) phone = null;
+    if (phone && phone.length === 11 && phone.startsWith("1")) phone = phone.slice(1);
+    if (!email && !phone) return res.status(400).json({ ok: false, error: "no contact" });
+
+    const step = b.step ? String(b.step).slice(0, 20) : null;
+    const dates = Array.isArray(b.dates) ? b.dates.slice(0, 4).join(" → ").slice(0, 120) : null;
+    const pageUrl = b.url ? String(b.url).split("?")[0].slice(0, 300) : null;
+    const firstName = b.first_name ? String(b.first_name).slice(0, 80) : null;
+    const lastName = b.last_name ? String(b.last_name).slice(0, 80) : null;
+
+    console.log("[tlc/capture] inbound email=" + (email ? "yes" : "no") + " phone=" + (phone ? "yes" : "no") + " step=" + step + " url=" + pageUrl);
+
+    // Respond fast; do downstream work after.
+    res.status(200).json({ ok: true });
+
+    const pool = await _pgGetPool();
+    let isNew = true;
+    if (pool) {
+      await _tlcEnsureTable(pool);
+      const conflictCol = email ? "email" : "phone";
+      const q = `INSERT INTO tlc_abandoned_leads (email, phone, first_name, last_name, step, dates, page_url)
+        VALUES ($1,$2,$3,$4,$5,$6,$7)
+        ON CONFLICT (${conflictCol}) WHERE ${conflictCol} IS NOT NULL DO UPDATE SET
+          phone = COALESCE(EXCLUDED.phone, tlc_abandoned_leads.phone),
+          email = COALESCE(EXCLUDED.email, tlc_abandoned_leads.email),
+          first_name = COALESCE(EXCLUDED.first_name, tlc_abandoned_leads.first_name),
+          last_name = COALESCE(EXCLUDED.last_name, tlc_abandoned_leads.last_name),
+          step = COALESCE(EXCLUDED.step, tlc_abandoned_leads.step),
+          dates = COALESCE(EXCLUDED.dates, tlc_abandoned_leads.dates),
+          updated_at = NOW()
+        RETURNING (xmax = 0) AS inserted, meta_audience_synced`;
+      try {
+        const ins = await pool.query(q, [email, phone, firstName, lastName, step, dates, pageUrl]);
+        isNew = ins.rows[0] && ins.rows[0].inserted;
+        if (ins.rows[0] && ins.rows[0].meta_audience_synced) return; // already pushed to Meta
+      } catch (e) {
+        console.log("[tlc/capture] pg upsert err:", e && e.message);
+      }
+    }
+
+    // Meta fan-out (idempotent on Meta's side — re-adding same hash is a no-op)
+    const aud = await _tlcMetaAudienceAppend(email, phone).catch((e) => ({ err: e.message }));
+    const capi = await _tlcMetaCapiLead(email, phone, pageUrl).catch((e) => ({ err: e.message }));
+    if (pool && aud && aud.ok) {
+      const idCol = email ? "email" : "phone";
+      pool.query(`UPDATE tlc_abandoned_leads SET meta_audience_synced = TRUE, meta_capi_synced = $1, updated_at = NOW() WHERE ${idCol} = $2`,
+        [!!(capi && capi.ok), email || phone]).catch(() => {});
+    }
+    // NOTE: google_cm_synced reserved — Google Customer Match upload pending
+    // account reinstatement + CM API allowlist. Add a daily job then.
+  } catch (err) {
+    console.error("[tlc/capture] err:", err && err.message);
+    if (!res.headersSent) res.status(500).json({ ok: false });
+  }
+});
+
+app.get("/tlc/leads/:code", async (req, res) => {
+  try {
+    if (req.params.code !== process.env.TLC_CAPTURE_CODE) return res.status(403).json({ ok: false });
+    const pool = await _pgGetPool();
+    if (!pool) return res.status(500).json({ ok: false, error: "no db" });
+    await _tlcEnsureTable(pool);
+    const r = await pool.query("SELECT email, phone, first_name, last_name, step, dates, page_url, meta_audience_synced, created_at, updated_at FROM tlc_abandoned_leads ORDER BY updated_at DESC LIMIT 200");
+    return res.status(200).json({ ok: true, count: r.rowCount, leads: r.rows });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err && err.message });
+  }
+});
+
+
 app.listen(process.env.PORT || 3000, () => {
   console.log("Server running");
 });
