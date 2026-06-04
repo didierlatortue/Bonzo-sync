@@ -196,6 +196,19 @@ async function bonzoGetProspectById(id) {
 // Source priority: 1) prospect.tags (set by /lead/inbound as "gclid:VALUE" etc.),
 //                  2) prospect notes scan (legacy audit trail), if no tags found.
 // Pass the prospect object if you already have it (avoids one API call).
+// Cowork 2026-06-04: extract a click-id (gclid/gbraid/wbraid) from a landing-page URL.
+function _coworkClickIdFromUrl(url, key) {
+  try { return new URL(String(url)).searchParams.get(key) || ""; } catch (e) { return ""; }
+}
+function _coworkFillClickIdsFromLandingPage(obj) {
+  const lp = (obj && (obj.landing_page || obj.page_url)) || "";
+  if (!lp) return obj;
+  for (const k of ["gclid", "gbraid", "wbraid"]) {
+    if (!obj[k]) { const v = _coworkClickIdFromUrl(lp, k); if (v) obj[k] = v; }
+  }
+  return obj;
+}
+
 async function bonzoGetAttribution(prospectId, prospect) {
   // 1. Tag-based lookup (preferred — no extra API call needed)
   try {
@@ -215,13 +228,13 @@ async function bonzoGetAttribution(prospectId, prospect) {
         // Match "key:value" or "key:hex:hexvalue".
         // Bonzo lowercases tag values; gclids are case-sensitive — so we hex-encode them.
         // Hex output is [0-9a-f], already lowercase, so survives Bonzo's normalization.
-        const m = String(t).match(/^(gclid|fbclid|utm_source|utm_medium|utm_campaign|utm_term|utm_content):(hex:)?(.+)$/i);
+        const m = String(t).match(/^(gclid|gbraid|wbraid|fbclid|utm_source|utm_medium|utm_campaign|utm_term|utm_content):(hex:)?(.+)$/i);
         if (m) {
           const key = m[1].toLowerCase();
           out[key] = m[2] ? hexdecode(m[3]) : m[3];
         }
       }
-      if (out.gclid || out.fbclid || out.utm_source) {
+      if (out.gclid || out.gbraid || out.wbraid || out.fbclid || out.utm_source) {
         console.log("[bonzoGetAttribution] tag-based hit for prospect " + prospectId + " keys=" + Object.keys(out).join(","));
         return out;
       }
@@ -236,12 +249,18 @@ async function bonzoGetAttribution(prospectId, prospect) {
     const list = (out.json && (out.json.data || out.json)) || [];
     if (!Array.isArray(list)) return {};
     for (const n of list) {
-      const body = (n && (n.note || n.body || n.content || n.text)) || "";
+      const rawBody = (n && (n.note || n.body || n.content || n.text)) || "";
+      // Cowork 2026-06-04: Bonzo HTML-escapes note bodies (&#34; &#61; &amp;) — decode before JSON.parse
+      const body = String(rawBody)
+        .replace(/&#34;|&quot;/g, '"').replace(/&#61;/g, "=")
+        .replace(/&#39;/g, "'").replace(/&amp;/g, "&");
       const m = String(body).match(/Cowork attribution capture:\s*([\s\S]+)$/);
       if (m) {
         try {
-          const obj = JSON.parse(m[1]);
-          if (obj && (obj.gclid || obj.fbclid || obj.utm_source || obj.lead_source)) {
+          let obj = JSON.parse(m[1]);
+          // Cowork 2026-06-04: iOS clicks carry gbraid (not gclid) — recover braid ids from the landing_page URL
+          obj = _coworkFillClickIdsFromLandingPage(obj);
+          if (obj && (obj.gclid || obj.gbraid || obj.wbraid || obj.fbclid || obj.utm_source || obj.lead_source)) {
             console.log("[bonzoGetAttribution] notes-based hit for prospect " + prospectId);
             return obj;
           }
@@ -902,9 +921,11 @@ app.post("/bonzo/events", async (req, res) => {
             try {
               const attr = await bonzoGetAttribution(prospect.id, prospect);
               const gclid = attr.gclid || "";
-              if (!gclid) {
-                console.log("[ARIVE-fanout] no gclid for prospect " + prospect.id + " (no prior form submission attribution found) — skipping Google Ads conv");
-                return; // Without gclid, uploadClickConversions has nothing to attribute against
+              const gbraid = attr.gbraid || "";
+              const wbraid = attr.wbraid || "";
+              if (!gclid && !gbraid && !wbraid) {
+                console.log("[ARIVE-fanout] no gclid/gbraid/wbraid for prospect " + prospect.id + " (no prior form submission attribution found) — skipping Google Ads conv");
+                return; // Without a click id, uploadClickConversions has nothing to attribute against
               }
               // Pick conv ID + value + Meta event name by kind
               let convId, value, metaEvent;
@@ -931,6 +952,8 @@ app.post("/bonzo/events", async (req, res) => {
                 header: () => null,
                 body: {
                   gclid: gclid,
+                  gbraid: gbraid,
+                  wbraid: wbraid,
                   fbclid: attr.fbclid || "",
                   email: prospect.email,
                   phone: prospect.phone,
@@ -953,7 +976,7 @@ app.post("/bonzo/events", async (req, res) => {
               };
               await _coworkHandleAdsUpload(fakeReq, fakeRes);
               console.log("[ARIVE-fanout] " + kind + " prospect=" + prospect.id +
-                " gclid=" + gclid.slice(0,8) + "… conv=" + convId +
+                " click_id=" + (gclid || gbraid || wbraid).slice(0,8) + "… conv=" + convId +
                 " ok=" + (captured && captured.ok) +
                 " google_http=" + (captured && captured.http) +
                 " meta_status=" + (captured && captured.meta_capi && captured.meta_capi.status));
@@ -1426,7 +1449,9 @@ function _coworkAttributionTags(flat) {
   return {
     // Cowork 2026-05-11: form_name wins over utm_source so /purchase pages with utm_source=google still route to Purchase Bonzo webhook
     lead_source: flat.lead_source || flat.form_name || flat.utm_source || "website",
-    gclid: flat.gclid || "",
+    gclid: flat.gclid || _coworkClickIdFromUrl(flat.landing_page || flat.page_url || "", "gclid"),
+    gbraid: flat.gbraid || _coworkClickIdFromUrl(flat.landing_page || flat.page_url || "", "gbraid"),
+    wbraid: flat.wbraid || _coworkClickIdFromUrl(flat.landing_page || flat.page_url || "", "wbraid"),
     fbclid: flat.fbclid || "",
     utm_source: flat.utm_source || "",
     utm_medium: flat.utm_medium || "",
@@ -1616,6 +1641,8 @@ async function _coworkHandleInboundWork(req, preFlat) {
         const hexenc = (s) => Buffer.from(String(s), "utf8").toString("hex");
         const attrTags = [];
         if (attr.gclid)  attrTags.push("gclid:hex:" + hexenc(attr.gclid));
+        if (attr.gbraid) attrTags.push("gbraid:hex:" + hexenc(attr.gbraid));
+        if (attr.wbraid) attrTags.push("wbraid:hex:" + hexenc(attr.wbraid));
         if (attr.fbclid) attrTags.push("fbclid:hex:" + hexenc(attr.fbclid));
         if (attr.utm_source)   attrTags.push("utm_source:"   + attr.utm_source);
         if (attr.utm_campaign) attrTags.push("utm_campaign:" + attr.utm_campaign);
@@ -1963,7 +1990,9 @@ async function _coworkHandleAdsUpload(req, res) {
   try {
     const b = req.body || {};
     const gclid = b.gclid || b.GCLID;
-    if (!gclid) return res.status(400).json({ ok: false, error: "gclid required" });
+    const gbraid = b.gbraid || "";
+    const wbraid = b.wbraid || "";
+    if (!gclid && !gbraid && !wbraid) return res.status(400).json({ ok: false, error: "gclid, gbraid, or wbraid required" });
     const value = parseFloat(b.conversion_value || b.value || 0);
     const currency = (b.currency_code || b.currency || "USD").toUpperCase();
     // conversion_time required by Google: RFC3339 with timezone, e.g. "2026-04-29 12:34:56-04:00"
@@ -1979,7 +2008,7 @@ async function _coworkHandleAdsUpload(req, res) {
       ct = d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate())+" "+
            pad(d.getHours())+":"+pad(d.getMinutes())+":"+pad(d.getSeconds())+sign+tzh+":"+tzm;
     }
-    const orderId = b.order_id || b.gclid + "-" + Date.now();
+    const orderId = b.order_id || (gclid || gbraid || wbraid) + "-" + Date.now();
     const _pcConvId = process.env.GOOGLE_ADS_FUNDED_LOAN_PAST_CLIENT_CONV_ID;
     const _convId = b.conversion_action_id ||
       ((b.past_client === true || b.past_client === "true" || b.past_client === 1) && _pcConvId
@@ -1990,15 +2019,20 @@ async function _coworkHandleAdsUpload(req, res) {
     const access = await _coworkGetAdsToken();
     const url = "https://googleads.googleapis.com/v20/customers/" +
       process.env.GOOGLE_ADS_CUSTOMER_ID + ":uploadClickConversions";
+    const _conv = {
+      conversionAction: convResource,
+      conversionDateTime: ct,
+      conversionValue: value,
+      currencyCode: currency,
+      orderId: orderId
+    };
+    // Exactly one click id per conversion. NOTE: gbraid/wbraid require the conversion
+    // action to use MANY_PER_CLICK counting (QA conv 7607422039 switched 2026-06-04).
+    if (gclid) _conv.gclid = gclid;
+    else if (gbraid) _conv.gbraid = gbraid;
+    else _conv.wbraid = wbraid;
     const payload = {
-      conversions: [{
-        gclid: gclid,
-        conversionAction: convResource,
-        conversionDateTime: ct,
-        conversionValue: value,
-        currencyCode: currency,
-        orderId: orderId
-      }],
+      conversions: [_conv],
       partialFailure: true,
       validateOnly: !!b.validate_only
     };
