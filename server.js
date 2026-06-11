@@ -1930,10 +1930,25 @@ const TURTUR_ROUTING_DRIP_IDS = [
   225522, // Past Client - Refi Outreach
 ];
 const APPT_CHECK_DELAYS_MIN = [2, 8, 16, 30];
-// Appointment Set wiring (2026-06-11): stage + confirm campaign created by Didier in Bonzo UI.
+// Appointment Set wiring (2026-06-11): stage created by Didier in Bonzo UI.
+// Confirm + day-before go out as DIRECT SMS (POST /prospects/:id/sms) — campaign
+// 238891 exists but its 9:00 AM day-anchor never fires for same-day enrollments,
+// so the system doesn't rely on it.
 const TURTUR_APPT_STAGE_ID = 458538;            // "Calendly Appt 🦆" in Buffer pipeline 45428
-const TURTUR_APPT_CONFIRM_CAMPAIGN_ID = 238891;  // "Calendly Appointment Set" — immediate confirm SMS
-const TURTUR_APPT_DAYBEFORE_CAMPAIGN_ID = null;  // pending — Didier hasn't created the day-before campaign yet
+const TURTUR_APPT_CONFIRM_SMS = (first) =>
+  "Hi " + (first || "there") + ", your appointment has been set. Save my number so we don't miss each other. Thanks";
+const TURTUR_APPT_DAYBEFORE_SMS = (first, dayWord, timeStr) =>
+  "Hi " + (first || "there") + ", Didier here — quick reminder about our call " + dayWord + " at " + timeStr +
+  ". I'll be calling from 754-224-5704. Need to move it? Use the reschedule link in your Calendly email. See you then!";
+function _coworkApptTimeParts(startIso) {
+  const d = new Date(startIso);
+  const timeStr = new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "numeric", minute: "2-digit" }).format(d);
+  const dayOf = new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
+  const today = new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+  const dayWord = dayOf === today ? "today" : "tomorrow";
+  const etHour = parseInt(new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "numeric", hour12: false }).format(new Date()), 10);
+  return { timeStr, dayWord, etHour };
+}
 // Stages it is safe to yank a prospect OUT of when they book. Deeper stages (Engaging,
 // Hot Lead, Pre-Approved, ...) are manually managed — tag + detach only, no stage move.
 const TURTUR_EARLY_FUNNEL_STAGE_IDS = [420176, 420120, 420154, 411901, 411869, 411990, 420226];
@@ -1998,42 +2013,40 @@ async function _coworkSuppressDripsForAppointment(prospect, appt, opts) {
     }
   } catch (e) { out.actions.push("stage_err:" + (e && e.message || e)); }
 
-  // 3) Campaign handling.
-  // First suppression: "Move to campaign" (POST /prospects/:id/campaign/:id) atomically
-  // REPLACES any attached drip with the confirm campaign and sets status active so the
-  // immediate confirm SMS can send. Do NOT set status responded here — it would kill
-  // the pending confirm event. The confirm campaign is 1-event; it goes quiet after.
+  // 3) Confirm SMS (direct send — deterministic, unlike campaign day-anchors),
+  // then cancel any queued drip events and flip status to responded (proven halt).
   if (!confirmAlreadySent) {
     try {
-      const r = await bonzoFetch("/prospects/" + prospect.id + "/campaign/" + TURTUR_APPT_CONFIRM_CAMPAIGN_ID, { method: "POST" });
-      if (r && r.ok) {
-        out.removed = attachedDrips;
-        out.actions.push("confirm_campaign_enrolled");
+      const sms = await bonzoFetch("/prospects/" + prospect.id + "/sms", {
+        method: "POST",
+        body: JSON.stringify({ message: TURTUR_APPT_CONFIRM_SMS(prospect.first_name), send_as: "owner" }),
+      });
+      if (sms && sms.ok) {
+        out.actions.push("confirm_sms_sent");
         try { await bonzoUpdateProspect(prospect.id, { tags: ["appt_confirm_sent"] }); } catch (e) {}
       } else {
-        out.actions.push("confirm_enroll_failed:" + (r && r.status));
+        out.actions.push("confirm_sms_failed:" + (sms && sms.status));
       }
-    } catch (e) { out.actions.push("confirm_enroll_err:" + (e && e.message || e)); }
-  } else if (attachedDrips.length) {
-    // Re-pass with drips re-attached: cancel queued events, then flip responded.
+    } catch (e) { out.actions.push("confirm_sms_err:" + (e && e.message || e)); }
+  }
+  if (attachedDrips.length) {
     for (let i = 0; i < 6; i++) {
       try {
         const ne = await bonzoFetch("/campaigns/" + prospect.id + "/next-event", { method: "POST" });
-        const evId = ne && ne.ok && ne.json && (ne.json.id || (ne.json.data && ne.json.data.id));
+        const pred = ne && ne.ok && ne.json && (ne.json.predict || ne.json);
+        const evId = pred && (pred.id || (pred.data && pred.data.id));
         if (!evId) break;
         const del = await bonzoFetch("/campaigns/" + prospect.id + "/next-event?next_event_id=" + encodeURIComponent(evId), { method: "DELETE" });
         if (!del || !del.ok) break;
         out.actions.push("event_canceled:" + evId);
       } catch (e) { out.actions.push("event_cancel_err:" + (e && e.message || e)); break; }
     }
-    try {
-      const st = await bonzoFetch("/prospects/" + prospect.id + "/status", { method: "POST", body: JSON.stringify({ status: "responded" }) });
-      out.actions.push(st && st.ok ? "status_responded" : "status_failed:" + (st && st.status));
-    } catch (e) { out.actions.push("status_err:" + (e && e.message || e)); }
     out.removed = attachedDrips;
-  } else {
-    out.actions.push("no_drips_attached");
   }
+  try {
+    const st = await bonzoFetch("/prospects/" + prospect.id + "/status", { method: "POST", body: JSON.stringify({ status: "responded" }) });
+    out.actions.push(st && st.ok ? "status_responded" : "status_failed:" + (st && st.status));
+  } catch (e) { out.actions.push("status_err:" + (e && e.message || e)); }
 
   // 4) Audit note.
   try {
@@ -2158,9 +2171,11 @@ async function _coworkFireDueReminders(dryRun) {
   );
   out.due = rows.length;
   if (!rows.length) return out;
-  if (!TURTUR_APPT_DAYBEFORE_CAMPAIGN_ID) { out.skipped.push("daybefore_campaign_not_configured"); return out; }
   for (const r of rows) {
     try {
+      const parts = _coworkApptTimeParts(r.start_time instanceof Date ? r.start_time.toISOString() : String(r.start_time));
+      // Quiet hours: only text between 08:00 and 20:00 ET; otherwise leave for next run.
+      if (parts.etHour < 8 || parts.etHour >= 20) { out.skipped.push(r.prospect_id + ":quiet_hours"); continue; }
       // Don't remind a cancelled appointment — re-verify against Calendly first.
       const appt = await _coworkFindCalendlyAppointment(r.email);
       if (!appt) {
@@ -2169,8 +2184,13 @@ async function _coworkFireDueReminders(dryRun) {
         continue;
       }
       if (dryRun) { out.skipped.push(r.prospect_id + ":dry_run"); continue; }
-      const en = await bonzoFetch("/prospects/" + r.prospect_id + "/campaign/" + TURTUR_APPT_DAYBEFORE_CAMPAIGN_ID, { method: "POST" });
-      if (!en || !en.ok) { out.skipped.push(r.prospect_id + ":enroll_failed:" + (en && en.status)); continue; }
+      const pr = await bonzoGetProspectById(r.prospect_id);
+      const first = (pr && pr.ok && pr.json && pr.json.first_name) || "";
+      const sms = await bonzoFetch("/prospects/" + r.prospect_id + "/sms", {
+        method: "POST",
+        body: JSON.stringify({ message: TURTUR_APPT_DAYBEFORE_SMS(first, parts.dayWord, parts.timeStr), send_as: "owner" }),
+      });
+      if (!sms || !sms.ok) { out.skipped.push(r.prospect_id + ":sms_failed:" + (sms && sms.status)); continue; }
       await pool.query("UPDATE appointment_reminders SET daybefore_sent = TRUE WHERE prospect_id = $1", [r.prospect_id]);
       out.fired += 1;
     } catch (e) {
