@@ -1969,79 +1969,109 @@ async function _coworkSuppressDripsForAppointment(prospect, appt, opts) {
   opts = opts || {};
   const out = { prospect_id: prospect.id, removed: [], actions: [], dry_run: !!opts.dryRun };
   const attached = (prospect.campaigns || []).map(c => (typeof c === "object" ? c.id : c));
-  for (const cid of TURTUR_ROUTING_DRIP_IDS) {
-    if (attached.indexOf(cid) === -1) continue;
-    if (opts.dryRun) { out.removed.push(String(cid) + ":dry_run"); continue; }
-    try {
-      await bonzoFetch("/prospects/" + prospect.id + "/campaigns/" + cid, { method: "DELETE" });
-      out.removed.push(cid);
-    } catch (e) { out.actions.push("unenroll_err:" + cid + ":" + (e && e.message || e)); }
+  const attachedDrips = attached.filter(id => TURTUR_ROUTING_DRIP_IDS.indexOf(id) !== -1);
+  const tagsL = getTagNames(prospect.tags || []).map(t => String(t).toLowerCase());
+  const confirmAlreadySent = tagsL.indexOf("appt_confirm_sent") !== -1;
+
+  if (opts.dryRun) {
+    out.removed = attachedDrips.map(id => String(id) + ":dry_run");
+    out.actions.push(confirmAlreadySent ? "would_detach_only" : "would_enroll_confirm");
+    return out;
   }
-  if (!opts.dryRun) {
-    const hadApptTag = getTagNames(prospect.tags || []).map(t => String(t).toLowerCase()).indexOf("appointment_set") !== -1;
+
+  // 1) Tags first (idempotent union via GET+merge+PUT).
+  try {
+    await bonzoUpdateProspect(prospect.id, { tags: ["appointment_set", "source:calendly"] });
+    out.actions.push("tags");
+  } catch (e) { out.actions.push("tags_err:" + (e && e.message || e)); }
+
+  // 2) Stage move — only out of early-funnel stages. Route: POST /prospects/:id/pipeline-stage/:stage
+  try {
+    const curStage = (prospect.pipeline_stage && prospect.pipeline_stage.id) || null;
+    if (curStage === TURTUR_APPT_STAGE_ID) {
+      out.actions.push("stage_already_set");
+    } else if (curStage && TURTUR_EARLY_FUNNEL_STAGE_IDS.indexOf(curStage) !== -1) {
+      const r = await bonzoFetch("/prospects/" + prospect.id + "/pipeline-stage/" + TURTUR_APPT_STAGE_ID, { method: "POST" });
+      out.actions.push(r && r.ok ? "moved_to_appt_stage" : "stage_move_failed:" + (r && r.status));
+    } else {
+      out.actions.push("stage_kept:" + curStage);
+    }
+  } catch (e) { out.actions.push("stage_err:" + (e && e.message || e)); }
+
+  // 3) Campaign handling.
+  // First suppression: "Move to campaign" (POST /prospects/:id/campaign/:id) atomically
+  // REPLACES any attached drip with the confirm campaign and sets status active so the
+  // immediate confirm SMS can send. Do NOT set status responded here — it would kill
+  // the pending confirm event. The confirm campaign is 1-event; it goes quiet after.
+  if (!confirmAlreadySent) {
     try {
-      // bonzoUpdateProspect unions tags (GET+merge+PUT) — safe for status + tags.
-      await bonzoUpdateProspect(prospect.id, {
-        status: "responded",
-        tags: ["appointment_set", "source:calendly"],
-      });
-      out.actions.push("status_responded+tags");
-    } catch (e) { out.actions.push("status_err:" + (e && e.message || e)); }
-    // Move to the Calendly Appt stage — only from early-funnel stages.
-    try {
-      const curStage = (prospect.pipeline_stage && prospect.pipeline_stage.id) || null;
-      if (curStage === TURTUR_APPT_STAGE_ID) {
-        out.actions.push("stage_already_set");
-      } else if (curStage && TURTUR_EARLY_FUNNEL_STAGE_IDS.indexOf(curStage) !== -1) {
-        await bonzoFetch("/prospects/" + prospect.id, { method: "PUT", body: JSON.stringify({ pipeline_stage_id: TURTUR_APPT_STAGE_ID }) });
-        out.actions.push("moved_to_appt_stage");
-      } else {
-        out.actions.push("stage_kept:" + curStage);
-      }
-    } catch (e) { out.actions.push("stage_err:" + (e && e.message || e)); }
-    // Enroll the confirm-SMS campaign once (first suppression only, never re-enroll).
-    try {
-      const attachedNow = (prospect.campaigns || []).map(c => (typeof c === "object" ? c.id : c));
-      if (!hadApptTag && attachedNow.indexOf(TURTUR_APPT_CONFIRM_CAMPAIGN_ID) === -1) {
-        await bonzoFetch("/prospects/" + prospect.id + "/campaigns/" + TURTUR_APPT_CONFIRM_CAMPAIGN_ID + "/start", { method: "POST" });
+      const r = await bonzoFetch("/prospects/" + prospect.id + "/campaign/" + TURTUR_APPT_CONFIRM_CAMPAIGN_ID, { method: "POST" });
+      if (r && r.ok) {
+        out.removed = attachedDrips;
         out.actions.push("confirm_campaign_enrolled");
+        try { await bonzoUpdateProspect(prospect.id, { tags: ["appt_confirm_sent"] }); } catch (e) {}
+      } else {
+        out.actions.push("confirm_enroll_failed:" + (r && r.status));
       }
     } catch (e) { out.actions.push("confirm_enroll_err:" + (e && e.message || e)); }
-    // Schedule the day-before reminder in Postgres (fired by the reconcile cron).
+  } else if (attachedDrips.length) {
+    // Re-pass with drips re-attached: cancel queued events, then flip responded.
+    for (let i = 0; i < 6; i++) {
+      try {
+        const ne = await bonzoFetch("/campaigns/" + prospect.id + "/next-event", { method: "POST" });
+        const evId = ne && ne.ok && ne.json && (ne.json.id || (ne.json.data && ne.json.data.id));
+        if (!evId) break;
+        const del = await bonzoFetch("/campaigns/" + prospect.id + "/next-event?next_event_id=" + encodeURIComponent(evId), { method: "DELETE" });
+        if (!del || !del.ok) break;
+        out.actions.push("event_canceled:" + evId);
+      } catch (e) { out.actions.push("event_cancel_err:" + (e && e.message || e)); break; }
+    }
     try {
-      if (appt && appt.start_time) {
-        const pool = await _pgGetPool();
-        if (pool) {
-          await pool.query(
-            `INSERT INTO appointment_reminders (prospect_id, email, start_time, daybefore_due, daybefore_sent)
-             VALUES ($1, $2, $3::timestamptz, $3::timestamptz - interval '24 hours', FALSE)
-             ON CONFLICT (prospect_id) DO UPDATE SET
-               email = EXCLUDED.email,
-               start_time = EXCLUDED.start_time,
-               daybefore_due = EXCLUDED.daybefore_due,
-               daybefore_sent = CASE WHEN appointment_reminders.start_time IS DISTINCT FROM EXCLUDED.start_time THEN FALSE ELSE appointment_reminders.daybefore_sent END`,
-            [String(prospect.id), String(prospect.email || ""), appt.start_time]
-          );
-          out.actions.push("reminder_scheduled");
-        }
-      }
-    } catch (e) { out.actions.push("reminder_schedule_err:" + (e && e.message || e)); }
-    try {
-      const bonzoBaseN = process.env.BONZO_BASE_URL || "https://app.getbonzo.com/api";
-      const bonzoTokenN = process.env.BONZO_TOKEN || process.env.BONZO_API_KEY;
-      const nr = await fetch(bonzoBaseN + "/prospects/" + prospect.id + "/notes", {
-        method: "POST",
-        headers: {
-          Authorization: "Bearer " + bonzoTokenN,
-          "Content-Type": "application/json",
-          Accept: "application/json",
-          "User-Agent": "Mozilla/5.0 (compatible) bonzo-sync",
-        },
-        body: JSON.stringify({ content: "Calendly appointment detected — routing drips suppressed.\nEvent: " + appt.name + "\nStart: " + appt.start_time + "\nRemoved campaigns: " + (out.removed.join(", ") || "none attached") }),
-      });
-      if (nr.ok) out.actions.push("note");
-    } catch (e) { out.actions.push("note_err:" + (e && e.message || e)); }
+      const st = await bonzoFetch("/prospects/" + prospect.id + "/status", { method: "POST", body: JSON.stringify({ status: "responded" }) });
+      out.actions.push(st && st.ok ? "status_responded" : "status_failed:" + (st && st.status));
+    } catch (e) { out.actions.push("status_err:" + (e && e.message || e)); }
+    out.removed = attachedDrips;
+  } else {
+    out.actions.push("no_drips_attached");
   }
+
+  // 4) Audit note.
+  try {
+    const bonzoBaseN = process.env.BONZO_BASE_URL || "https://app.getbonzo.com/api";
+    const bonzoTokenN = process.env.BONZO_TOKEN || process.env.BONZO_API_KEY;
+    const nr = await fetch(bonzoBaseN + "/prospects/" + prospect.id + "/notes", {
+      method: "POST",
+      headers: {
+        Authorization: "Bearer " + bonzoTokenN,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        "User-Agent": "Mozilla/5.0 (compatible) bonzo-sync",
+      },
+      body: JSON.stringify({ content: "Calendly appointment detected — drip suppression ran.\nEvent: " + appt.name + "\nStart: " + appt.start_time + "\nDetached: " + (out.removed.join(", ") || "none") + "\nActions: " + out.actions.join(", ") }),
+    });
+    if (nr.ok) out.actions.push("note");
+  } catch (e) { out.actions.push("note_err:" + (e && e.message || e)); }
+
+  // 5) Day-before reminder schedule (fired by the reconcile cron).
+  try {
+    if (appt && appt.start_time) {
+      const pool = await _pgGetPool();
+      if (pool) {
+        await pool.query(
+          `INSERT INTO appointment_reminders (prospect_id, email, start_time, daybefore_due, daybefore_sent)
+           VALUES ($1, $2, $3::timestamptz, $3::timestamptz - interval '24 hours', FALSE)
+           ON CONFLICT (prospect_id) DO UPDATE SET
+             email = EXCLUDED.email,
+             start_time = EXCLUDED.start_time,
+             daybefore_due = EXCLUDED.daybefore_due,
+             daybefore_sent = CASE WHEN appointment_reminders.start_time IS DISTINCT FROM EXCLUDED.start_time THEN FALSE ELSE appointment_reminders.daybefore_sent END`,
+          [String(prospect.id), String(prospect.email || ""), appt.start_time]
+        );
+        out.actions.push("reminder_scheduled");
+      }
+    }
+  } catch (e) { out.actions.push("reminder_schedule_err:" + (e && e.message || e)); }
+
   return out;
 }
 
@@ -2139,7 +2169,8 @@ async function _coworkFireDueReminders(dryRun) {
         continue;
       }
       if (dryRun) { out.skipped.push(r.prospect_id + ":dry_run"); continue; }
-      await bonzoFetch("/prospects/" + r.prospect_id + "/campaigns/" + TURTUR_APPT_DAYBEFORE_CAMPAIGN_ID + "/start", { method: "POST" });
+      const en = await bonzoFetch("/prospects/" + r.prospect_id + "/campaign/" + TURTUR_APPT_DAYBEFORE_CAMPAIGN_ID, { method: "POST" });
+      if (!en || !en.ok) { out.skipped.push(r.prospect_id + ":enroll_failed:" + (en && en.status)); continue; }
       await pool.query("UPDATE appointment_reminders SET daybefore_sent = TRUE WHERE prospect_id = $1", [r.prospect_id]);
       out.fired += 1;
     } catch (e) {
@@ -2753,18 +2784,17 @@ function _decideLeadFate(prospect) {
 }
 
 async function _executeLeadDecision(prospect, decision) {
+  // COWORK 2026-06-11: rewritten with real Bonzo v3 routes (the old PUT/DELETE/start
+  // routes never existed — they 404'd silently because bonzoFetch doesn't throw).
   const actions = [];
   try {
-    await bonzoFetch("/prospects/" + prospect.id, { method: "PUT", body: JSON.stringify({ pipeline_stage_id: decision.target_stage_id }) });
-    actions.push("moved_stage");
+    const r = await bonzoFetch("/prospects/" + prospect.id + "/pipeline-stage/" + decision.target_stage_id, { method: "POST" });
+    actions.push(r && r.ok ? "moved_stage" : "stage_failed:" + (r && r.status));
   } catch (e) { actions.push("stage_err:" + e.message); }
   try {
-    await bonzoFetch("/prospects/" + prospect.id + "/campaigns/" + TURTUR_PURCHASE_INSTANT_RESPONSE_ID, { method: "DELETE" });
-    actions.push("unenrolled_pir");
-  } catch (e) { actions.push("unenroll_err:" + e.message); }
-  try {
-    await bonzoFetch("/prospects/" + prospect.id + "/campaigns/" + decision.target_campaign_id + "/start", { method: "POST" });
-    actions.push("enrolled_target");
+    // "Move to campaign" REPLACES the current campaign (detaches Purchase Instant Response).
+    const r = await bonzoFetch("/prospects/" + prospect.id + "/campaign/" + decision.target_campaign_id, { method: "POST" });
+    actions.push(r && r.ok ? "moved_to_target_campaign" : "campaign_failed:" + (r && r.status));
   } catch (e) { actions.push("enroll_err:" + e.message); }
   return actions;
 }
