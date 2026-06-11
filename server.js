@@ -1480,6 +1480,10 @@ function _coworkHandleInbound(req, res) {
       _coworkHandleInboundWork(req, flat).catch(e =>
         console.error("[lead/inbound] async work error:", e && e.stack || e));
     });
+    // COWORK 2026-06-11: timed appointment checks (T+2/8/16/30m) — if this lead
+    // books a Calendly appointment right after the form, detach routing drips
+    // before the first send.
+    if (email) _coworkScheduleAppointmentChecks(email);
   } catch (e) {
     console.error("[lead/inbound] sync ack error:", e && e.stack || e);
     if (!res.headersSent) {
@@ -1877,15 +1881,26 @@ async function _coworkHandleCalendlyClientsideAttr(req, res) {
     const existingTags = getTagNames(prospect.tags || []);
     const merged = addTags(existingTags, newTags);
 
-    const patch = {
-      tags: merged,
-      // Always-safe: a few well-known fields that Bonzo accepts on prospect update
-      lead_source: "Calendly Consultation" + (utm.utm_source ? (" (" + utm.utm_source + ")") : ""),
-    };
+    const patch = { tags: merged };
+    // COWORK 2026-06-11: only set lead_source when the prospect has none —
+    // a form lead's "Purchase Options Form" etc. must survive a later booking.
+    const _existingLeadSource = prospect.lead_source || (prospect.mortgage && prospect.mortgage.lead_source) || "";
+    if (!_existingLeadSource) {
+      patch.lead_source = "Calendly Consultation" + (utm.utm_source ? (" (" + utm.utm_source + ")") : "");
+    }
 
     const upd = await bonzoUpdateProspect(prospect.id, patch);
 
-    return res.json({ ok: true, prospect_id: prospect.id, tags_added: newTags });
+    // COWORK 2026-06-11: a booking means no drip should run — suppress now and
+    // re-check on timers so a late Got Lead routing assignment can't win.
+    let suppression = null;
+    try {
+      const appt = await _coworkFindCalendlyAppointment(inv.email);
+      if (appt) suppression = await _coworkSuppressDripsForAppointment(prospect, appt, {});
+    } catch (e) { console.warn("[clientside-attr] suppression error:", e && e.message); }
+    if (inv.email) _coworkScheduleAppointmentChecks(inv.email);
+
+    return res.json({ ok: true, prospect_id: prospect.id, tags_added: newTags, suppression: suppression });
   } catch (e) {
     console.error("[clientside-attr] error:", e && e.stack || e);
     return res.status(500).json({ ok: false, error: e.message || String(e) });
@@ -1897,6 +1912,209 @@ app.post("/calendly/clientside-attr/:code", express.json({ limit: "256kb" }), (r
   return _coworkHandleCalendlyClientsideAttr(req, res);
 });
 // === END COWORK 2026-06-02 ===
+
+
+
+// === COWORK 2026-06-11: Appointment-aware drip suppression ===
+// When a lead books a Calendly appointment, no routing drip should touch them.
+// Calendly Basic plan has no webhooks, so we poll: timed checks after every
+// /lead/inbound, a page-side booking ping (/calendly/booked), and a reconcile
+// sweep (/appointments/reconcile/:code) on GHA cron for bookings made later or
+// from email links. Suppression = detach routing drips + status "responded"
+// (mirrors Didier's manual move) + tag appointment_set + audit note.
+
+const TURTUR_ROUTING_DRIP_IDS = [
+  212081, // Ad — Purchase Instant Response
+  215828, // Ad — Refi Instant Response updated
+  216141, // Ad - Abandoned Lead bring back
+  225522, // Past Client - Refi Outreach
+];
+const APPT_CHECK_DELAYS_MIN = [2, 8, 16, 30];
+
+async function _coworkFindCalendlyAppointment(email) {
+  const pat = String(process.env.CALENDLY_PAT || "").trim();
+  const e = String(email || "").trim().toLowerCase();
+  if (!pat || !e) return null;
+  const h = { Authorization: "Bearer " + pat, Accept: "application/json" };
+  const me = await fetch("https://api.calendly.com/users/me", { headers: h });
+  if (!me.ok) throw new Error("calendly /users/me " + me.status);
+  const meJ = await me.json();
+  const userUri = meJ && meJ.resource && meJ.resource.uri;
+  if (!userUri) return null;
+  const qs = new URLSearchParams({
+    user: userUri,
+    invitee_email: e,
+    status: "active",
+    min_start_time: new Date().toISOString(),
+    count: "5",
+  });
+  const ev = await fetch("https://api.calendly.com/scheduled_events?" + qs.toString(), { headers: h });
+  if (!ev.ok) throw new Error("calendly scheduled_events " + ev.status);
+  const evJ = await ev.json();
+  const list = (evJ && evJ.collection) || [];
+  if (!list.length) return null;
+  list.sort((a, b) => String(a.start_time || "").localeCompare(String(b.start_time || "")));
+  const e0 = list[0];
+  return { name: e0.name || "Calendly appointment", start_time: e0.start_time || "", uri: e0.uri || "" };
+}
+
+async function _coworkSuppressDripsForAppointment(prospect, appt, opts) {
+  opts = opts || {};
+  const out = { prospect_id: prospect.id, removed: [], actions: [], dry_run: !!opts.dryRun };
+  const attached = (prospect.campaigns || []).map(c => (typeof c === "object" ? c.id : c));
+  for (const cid of TURTUR_ROUTING_DRIP_IDS) {
+    if (attached.indexOf(cid) === -1) continue;
+    if (opts.dryRun) { out.removed.push(String(cid) + ":dry_run"); continue; }
+    try {
+      await bonzoFetch("/prospects/" + prospect.id + "/campaigns/" + cid, { method: "DELETE" });
+      out.removed.push(cid);
+    } catch (e) { out.actions.push("unenroll_err:" + cid + ":" + (e && e.message || e)); }
+  }
+  if (!opts.dryRun) {
+    try {
+      // bonzoUpdateProspect unions tags (GET+merge+PUT) — safe for status + tags.
+      await bonzoUpdateProspect(prospect.id, {
+        status: "responded",
+        tags: ["appointment_set", "source:calendly"],
+      });
+      out.actions.push("status_responded+tags");
+    } catch (e) { out.actions.push("status_err:" + (e && e.message || e)); }
+    try {
+      const bonzoBaseN = process.env.BONZO_BASE_URL || "https://app.getbonzo.com/api";
+      const bonzoTokenN = process.env.BONZO_TOKEN || process.env.BONZO_API_KEY;
+      const nr = await fetch(bonzoBaseN + "/prospects/" + prospect.id + "/notes", {
+        method: "POST",
+        headers: {
+          Authorization: "Bearer " + bonzoTokenN,
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          "User-Agent": "Mozilla/5.0 (compatible) bonzo-sync",
+        },
+        body: JSON.stringify({ content: "Calendly appointment detected — routing drips suppressed.\nEvent: " + appt.name + "\nStart: " + appt.start_time + "\nRemoved campaigns: " + (out.removed.join(", ") || "none attached") }),
+      });
+      if (nr.ok) out.actions.push("note");
+    } catch (e) { out.actions.push("note_err:" + (e && e.message || e)); }
+  }
+  return out;
+}
+
+async function _coworkAppointmentCheckByEmail(email, opts) {
+  opts = opts || {};
+  const appt = await _coworkFindCalendlyAppointment(email);
+  if (!appt) return { found: false, email: email };
+  const candidates = await bonzoFindProspectCandidatesByEmail(email);
+  const want = String(email || "").trim().toLowerCase();
+  let prospect = null;
+  for (const c of candidates) {
+    if (String(c.email || "").trim().toLowerCase() === want) { prospect = c; break; }
+  }
+  if (!prospect && candidates.length === 1) prospect = candidates[0];
+  if (!prospect) return { found: true, prospect: false, email: email };
+  const tagNamesL = getTagNames(prospect.tags || []).map(t => String(t).toLowerCase());
+  const attachedDrips = (prospect.campaigns || []).map(c => (typeof c === "object" ? c.id : c)).filter(id => TURTUR_ROUTING_DRIP_IDS.indexOf(id) !== -1);
+  if (tagNamesL.indexOf("appointment_set") !== -1 && attachedDrips.length === 0) {
+    return { found: true, already_done: true, prospect_id: prospect.id };
+  }
+  const suppression = await _coworkSuppressDripsForAppointment(prospect, appt, opts);
+  return { found: true, appt: appt, suppression: suppression };
+}
+
+function _coworkScheduleAppointmentChecks(email) {
+  const e = String(email || "").trim();
+  if (!e) return;
+  for (const min of APPT_CHECK_DELAYS_MIN) {
+    const t = setTimeout(() => {
+      _coworkAppointmentCheckByEmail(e, {})
+        .then(r => {
+          if (r && r.found) console.log("[appt-check] t+" + min + "m " + e + " → " + JSON.stringify(r.suppression || { already_done: r.already_done, prospect: r.prospect }));
+        })
+        .catch(err => console.warn("[appt-check] t+" + min + "m error:", err && err.message));
+    }, min * 60 * 1000);
+    if (t && typeof t.unref === "function") t.unref();
+  }
+}
+
+// Page-side booking ping — no :code (the invitee_uri must resolve via our
+// Calendly PAT, which is the real auth: forged URIs do nothing). Rate-limited.
+const _coworkBookedHits = new Map();
+function _coworkBookedRateOk(ip) {
+  const now = Date.now();
+  const rec = _coworkBookedHits.get(ip) || { count: 0, reset: now + 3600 * 1000 };
+  if (now > rec.reset) { rec.count = 0; rec.reset = now + 3600 * 1000; }
+  rec.count += 1;
+  _coworkBookedHits.set(ip, rec);
+  if (_coworkBookedHits.size > 5000) _coworkBookedHits.clear();
+  return rec.count <= 30;
+}
+
+app.post("/calendly/booked", express.json({ limit: "64kb" }), async (req, res) => {
+  try {
+    const ip = String(req.headers["x-forwarded-for"] || req.ip || "?").split(",")[0].trim();
+    if (!_coworkBookedRateOk(ip)) return res.status(429).json({ ok: false, error: "rate limited" });
+    const inv_uri = String((req.body || {}).invitee_uri || "").trim();
+    if (!/^https:\/\/api\.calendly\.com\/scheduled_events\/[^/]+\/invitees\/[^/]+$/.test(inv_uri)) {
+      return res.status(400).json({ ok: false, error: "invitee_uri shape invalid" });
+    }
+    const inv = await _coworkResolveCalendlyInvitee(inv_uri);
+    if (!inv.email) return res.status(404).json({ ok: false, error: "invitee has no email" });
+    res.json({ ok: true, queued: true });
+    setImmediate(() => {
+      _coworkAppointmentCheckByEmail(inv.email, {})
+        .then(r => console.log("[calendly/booked] " + inv.email + " → " + JSON.stringify(r.suppression || r)))
+        .catch(e => console.warn("[calendly/booked] error:", e && e.message));
+      // Re-assert after Bonzo's routing delay so a late campaign assignment can't win.
+      _coworkScheduleAppointmentChecks(inv.email);
+    });
+  } catch (e) {
+    console.error("[calendly/booked] error:", e && e.stack || e);
+    if (!res.headersSent) res.status(500).json({ ok: false, error: e.message || String(e) });
+  }
+});
+
+// Reconcile sweep — catches bookings made from email links or after the timed
+// checks. Default dry-run; GHA cron calls with ?dry_run=false.
+app.post("/appointments/reconcile/:code", express.json({ limit: "256kb" }), async (req, res) => {
+  if (req.params.code !== process.env.LEAD_INBOUND_CODE) return res.status(401).json({ ok: false, error: "Unauthorized" });
+  try {
+    const dryRun = req.query.dry_run !== "false";
+    const hours = Math.min(parseInt(req.query.hours, 10) || 48, 168);
+    const maxLookups = Math.min(parseInt(req.query.limit, 10) || 25, 50);
+    const cutoff = Date.now() - hours * 3600 * 1000;
+    const candidates = [];
+    for (let page = 1; page <= 3; page++) {
+      const r = await bonzoFetch("/prospects?per_page=100&page=" + page, { method: "GET" });
+      const data = (r && r.json && r.json.data) || [];
+      if (!data.length) break;
+      let allOlder = true;
+      for (const p of data) {
+        const t = p.created_at ? new Date(p.created_at).getTime() : 0;
+        if (t >= cutoff) allOlder = false; else continue;
+        if (!p.email) continue;
+        const tagsL = getTagNames(p.tags || []).map(s => String(s).toLowerCase());
+        if (tagsL.indexOf("appointment_set") !== -1) continue;
+        const drips = (p.campaigns || []).map(c => (typeof c === "object" ? c.id : c)).filter(id => TURTUR_ROUTING_DRIP_IDS.indexOf(id) !== -1);
+        if (!drips.length) continue;
+        candidates.push(p);
+      }
+      if (allOlder) break;
+    }
+    const results = [];
+    for (const p of candidates.slice(0, maxLookups)) {
+      try {
+        const appt = await _coworkFindCalendlyAppointment(p.email);
+        if (!appt) { results.push({ id: p.id, email: p.email, appt: false }); continue; }
+        const suppression = await _coworkSuppressDripsForAppointment(p, appt, { dryRun: dryRun });
+        results.push({ id: p.id, email: p.email, appt: appt.start_time, suppression: suppression });
+      } catch (e) {
+        results.push({ id: p.id, email: p.email, error: e && e.message || String(e) });
+      }
+    }
+    res.json({ ok: true, dry_run: dryRun, window_hours: hours, candidates: candidates.length, checked: Math.min(candidates.length, maxLookups), results: results });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message || String(e) });
+  }
+});
+// === END COWORK 2026-06-11 APPOINTMENT SUPPRESSION ===
 
 
 // === COWORK 2026-04-29: /google-ads/upload-conversion ===

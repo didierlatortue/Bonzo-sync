@@ -1,0 +1,20 @@
+name: appointment-reconcile
+# Sweep recent prospects: anyone with a routing drip attached who has an
+# active future Calendly appointment gets suppressed (drips detached,
+# status responded, appointment_set tag). Backstop for bookings made from
+# email links or after the in-process timed checks.
+on:
+  schedule:
+    - cron: "*/20 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Hit reconcile endpoint (live)
+        run: |
+          curl -sS -X POST \
+            "https://bonzo-sync.onrender.com/appointments/reconcile/${{ secrets.LEAD_INBOUND_CODE }}?dry_run=false&hours=48" \
+            --max-time 180 | head -c 2000
