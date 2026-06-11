@@ -1930,6 +1930,13 @@ const TURTUR_ROUTING_DRIP_IDS = [
   225522, // Past Client - Refi Outreach
 ];
 const APPT_CHECK_DELAYS_MIN = [2, 8, 16, 30];
+// Appointment Set wiring (2026-06-11): stage + confirm campaign created by Didier in Bonzo UI.
+const TURTUR_APPT_STAGE_ID = 458538;            // "Calendly Appt 🦆" in Buffer pipeline 45428
+const TURTUR_APPT_CONFIRM_CAMPAIGN_ID = 238891;  // "Calendly Appointment Set" — immediate confirm SMS
+const TURTUR_APPT_DAYBEFORE_CAMPAIGN_ID = null;  // pending — Didier hasn't created the day-before campaign yet
+// Stages it is safe to yank a prospect OUT of when they book. Deeper stages (Engaging,
+// Hot Lead, Pre-Approved, ...) are manually managed — tag + detach only, no stage move.
+const TURTUR_EARLY_FUNNEL_STAGE_IDS = [420176, 420120, 420154, 411901, 411869, 411990, 420226];
 
 async function _coworkFindCalendlyAppointment(email) {
   const pat = String(process.env.CALENDLY_PAT || "").trim();
@@ -1971,6 +1978,7 @@ async function _coworkSuppressDripsForAppointment(prospect, appt, opts) {
     } catch (e) { out.actions.push("unenroll_err:" + cid + ":" + (e && e.message || e)); }
   }
   if (!opts.dryRun) {
+    const hadApptTag = getTagNames(prospect.tags || []).map(t => String(t).toLowerCase()).indexOf("appointment_set") !== -1;
     try {
       // bonzoUpdateProspect unions tags (GET+merge+PUT) — safe for status + tags.
       await bonzoUpdateProspect(prospect.id, {
@@ -1979,6 +1987,45 @@ async function _coworkSuppressDripsForAppointment(prospect, appt, opts) {
       });
       out.actions.push("status_responded+tags");
     } catch (e) { out.actions.push("status_err:" + (e && e.message || e)); }
+    // Move to the Calendly Appt stage — only from early-funnel stages.
+    try {
+      const curStage = (prospect.pipeline_stage && prospect.pipeline_stage.id) || null;
+      if (curStage === TURTUR_APPT_STAGE_ID) {
+        out.actions.push("stage_already_set");
+      } else if (curStage && TURTUR_EARLY_FUNNEL_STAGE_IDS.indexOf(curStage) !== -1) {
+        await bonzoFetch("/prospects/" + prospect.id, { method: "PUT", body: JSON.stringify({ pipeline_stage_id: TURTUR_APPT_STAGE_ID }) });
+        out.actions.push("moved_to_appt_stage");
+      } else {
+        out.actions.push("stage_kept:" + curStage);
+      }
+    } catch (e) { out.actions.push("stage_err:" + (e && e.message || e)); }
+    // Enroll the confirm-SMS campaign once (first suppression only, never re-enroll).
+    try {
+      const attachedNow = (prospect.campaigns || []).map(c => (typeof c === "object" ? c.id : c));
+      if (!hadApptTag && attachedNow.indexOf(TURTUR_APPT_CONFIRM_CAMPAIGN_ID) === -1) {
+        await bonzoFetch("/prospects/" + prospect.id + "/campaigns/" + TURTUR_APPT_CONFIRM_CAMPAIGN_ID + "/start", { method: "POST" });
+        out.actions.push("confirm_campaign_enrolled");
+      }
+    } catch (e) { out.actions.push("confirm_enroll_err:" + (e && e.message || e)); }
+    // Schedule the day-before reminder in Postgres (fired by the reconcile cron).
+    try {
+      if (appt && appt.start_time) {
+        const pool = await _pgGetPool();
+        if (pool) {
+          await pool.query(
+            `INSERT INTO appointment_reminders (prospect_id, email, start_time, daybefore_due, daybefore_sent)
+             VALUES ($1, $2, $3::timestamptz, $3::timestamptz - interval '24 hours', FALSE)
+             ON CONFLICT (prospect_id) DO UPDATE SET
+               email = EXCLUDED.email,
+               start_time = EXCLUDED.start_time,
+               daybefore_due = EXCLUDED.daybefore_due,
+               daybefore_sent = CASE WHEN appointment_reminders.start_time IS DISTINCT FROM EXCLUDED.start_time THEN FALSE ELSE appointment_reminders.daybefore_sent END`,
+            [String(prospect.id), String(prospect.email || ""), appt.start_time]
+          );
+          out.actions.push("reminder_scheduled");
+        }
+      }
+    } catch (e) { out.actions.push("reminder_schedule_err:" + (e && e.message || e)); }
     try {
       const bonzoBaseN = process.env.BONZO_BASE_URL || "https://app.getbonzo.com/api";
       const bonzoTokenN = process.env.BONZO_TOKEN || process.env.BONZO_API_KEY;
@@ -2071,6 +2118,37 @@ app.post("/appointments/booked", express.json({ limit: "64kb" }), async (req, re
   }
 });
 
+// Fire day-before reminders that have come due. Called from the reconcile cron.
+async function _coworkFireDueReminders(dryRun) {
+  const out = { due: 0, fired: 0, skipped: [], dry_run: !!dryRun };
+  const pool = await _pgGetPool();
+  if (!pool) { out.skipped.push("no_database_url"); return out; }
+  const { rows } = await pool.query(
+    "SELECT prospect_id, email, start_time FROM appointment_reminders WHERE NOT daybefore_sent AND daybefore_due <= now() AND start_time > now()"
+  );
+  out.due = rows.length;
+  if (!rows.length) return out;
+  if (!TURTUR_APPT_DAYBEFORE_CAMPAIGN_ID) { out.skipped.push("daybefore_campaign_not_configured"); return out; }
+  for (const r of rows) {
+    try {
+      // Don't remind a cancelled appointment — re-verify against Calendly first.
+      const appt = await _coworkFindCalendlyAppointment(r.email);
+      if (!appt) {
+        await pool.query("UPDATE appointment_reminders SET daybefore_sent = TRUE WHERE prospect_id = $1", [r.prospect_id]);
+        out.skipped.push(r.prospect_id + ":no_active_appointment");
+        continue;
+      }
+      if (dryRun) { out.skipped.push(r.prospect_id + ":dry_run"); continue; }
+      await bonzoFetch("/prospects/" + r.prospect_id + "/campaigns/" + TURTUR_APPT_DAYBEFORE_CAMPAIGN_ID + "/start", { method: "POST" });
+      await pool.query("UPDATE appointment_reminders SET daybefore_sent = TRUE WHERE prospect_id = $1", [r.prospect_id]);
+      out.fired += 1;
+    } catch (e) {
+      out.skipped.push(r.prospect_id + ":err:" + (e && e.message || e));
+    }
+  }
+  return out;
+}
+
 // Reconcile sweep — catches bookings made from email links or after the timed
 // checks. Default dry-run; GHA cron calls with ?dry_run=false.
 app.post("/appointments/reconcile/:code", express.json({ limit: "256kb" }), async (req, res) => {
@@ -2109,7 +2187,9 @@ app.post("/appointments/reconcile/:code", express.json({ limit: "256kb" }), asyn
         results.push({ id: p.id, email: p.email, error: e && e.message || String(e) });
       }
     }
-    res.json({ ok: true, dry_run: dryRun, window_hours: hours, candidates: candidates.length, checked: Math.min(candidates.length, maxLookups), results: results });
+    let reminders = null;
+    try { reminders = await _coworkFireDueReminders(dryRun); } catch (e) { reminders = { error: e && e.message || String(e) }; }
+    res.json({ ok: true, dry_run: dryRun, window_hours: hours, candidates: candidates.length, checked: Math.min(candidates.length, maxLookups), results: results, reminders: reminders });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message || String(e) });
   }
@@ -2381,6 +2461,15 @@ async function _pgGetPool() {
   )`);
   await _pgPool.query("CREATE INDEX IF NOT EXISTS past_clients_email_hash_idx ON past_clients(email_hash) WHERE email_hash IS NOT NULL");
   await _pgPool.query("CREATE INDEX IF NOT EXISTS past_clients_phone_hash_idx ON past_clients(phone_hash) WHERE phone_hash IS NOT NULL");
+  // === COWORK 2026-06-11: appointment day-before reminder schedule ===
+  await _pgPool.query(`CREATE TABLE IF NOT EXISTS appointment_reminders (
+    prospect_id TEXT PRIMARY KEY,
+    email TEXT,
+    start_time TIMESTAMPTZ NOT NULL,
+    daybefore_due TIMESTAMPTZ NOT NULL,
+    daybefore_sent BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  )`);
   // === COWORK 2026-06-03: google_contacts cache (bonzo_id -> People API resourceName) ===
   await _pgPool.query(`CREATE TABLE IF NOT EXISTS google_contacts (
     bonzo_id TEXT PRIMARY KEY,
@@ -2652,6 +2741,10 @@ function _decideLeadFate(prospect) {
   const hasBadPhone = tagNames.includes("bad_phone");
   if (prospect.do_not_call || (Array.isArray(prospect.opt_outs) && prospect.opt_outs.length > 0)) {
     return { decision: "skip_opted_out", reason: "do_not_call or opt_out present" };
+  }
+  // COWORK 2026-06-11: a booked appointment is not a stale lead — leave them alone.
+  if (tagNames.includes("appointment_set")) {
+    return { decision: "skip_appointment_set", reason: "active appointment booked" };
   }
   if (hasBadEmail && hasBadPhone) return { decision: "bad_lead", target_campaign_id: TURTUR_BAD_CAMPAIGN_ID, target_stage_id: TURTUR_BAD_LEAD_STAGE_ID };
   if (hasBadEmail)                return { decision: "text_nurture", target_campaign_id: TURTUR_TEXT_NURTURE_CAMPAIGN_ID, target_stage_id: TURTUR_NURTURE_STAGE_ID };
