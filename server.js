@@ -1506,7 +1506,7 @@ async function _coworkHandleInboundWork(req, preFlat) {
     const first_name = flat.first_name || "";
     const last_name = flat.last_name || "";
 
-    const bonzoBase = process.env.BONZO_BASE_URL || "https://app.getbonzo.com/api";
+    const bonzoBase = process.env.BONZO_BASE_URL || "https://app.getbonzo.com/api/v3";
     const bonzoToken = process.env.BONZO_TOKEN || process.env.BONZO_API_KEY;
     const headers = {
       "Authorization": `Bearer ${bonzoToken}`,
@@ -1832,7 +1832,7 @@ async function _coworkHandleCalendlyClientsideAttr(req, res) {
     };
 
     // Find Bonzo prospect by email then phone
-    const bonzoBase = process.env.BONZO_BASE_URL || "https://app.getbonzo.com/api";
+    const bonzoBase = process.env.BONZO_BASE_URL || "https://app.getbonzo.com/api/v3";
     const bonzoToken = process.env.BONZO_TOKEN || process.env.BONZO_API_KEY;
     const headers = {
       "Authorization": "Bearer " + bonzoToken,
@@ -2050,7 +2050,7 @@ async function _coworkSuppressDripsForAppointment(prospect, appt, opts) {
 
   // 4) Audit note.
   try {
-    const bonzoBaseN = process.env.BONZO_BASE_URL || "https://app.getbonzo.com/api";
+    const bonzoBaseN = process.env.BONZO_BASE_URL || "https://app.getbonzo.com/api/v3";
     const bonzoTokenN = process.env.BONZO_TOKEN || process.env.BONZO_API_KEY;
     const nr = await fetch(bonzoBaseN + "/prospects/" + prospect.id + "/notes", {
       method: "POST",
