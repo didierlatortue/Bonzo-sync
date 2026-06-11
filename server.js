@@ -2047,7 +2047,7 @@ function _coworkBookedRateOk(ip) {
   return rec.count <= 30;
 }
 
-app.post("/calendly/booked", express.json({ limit: "64kb" }), async (req, res) => {
+app.post("/appointments/booked", express.json({ limit: "64kb" }), async (req, res) => {
   try {
     const ip = String(req.headers["x-forwarded-for"] || req.ip || "?").split(",")[0].trim();
     if (!_coworkBookedRateOk(ip)) return res.status(429).json({ ok: false, error: "rate limited" });
@@ -2060,13 +2060,13 @@ app.post("/calendly/booked", express.json({ limit: "64kb" }), async (req, res) =
     res.json({ ok: true, queued: true });
     setImmediate(() => {
       _coworkAppointmentCheckByEmail(inv.email, {})
-        .then(r => console.log("[calendly/booked] " + inv.email + " → " + JSON.stringify(r.suppression || r)))
-        .catch(e => console.warn("[calendly/booked] error:", e && e.message));
+        .then(r => console.log("[appointments/booked] " + inv.email + " → " + JSON.stringify(r.suppression || r)))
+        .catch(e => console.warn("[appointments/booked] error:", e && e.message));
       // Re-assert after Bonzo's routing delay so a late campaign assignment can't win.
       _coworkScheduleAppointmentChecks(inv.email);
     });
   } catch (e) {
-    console.error("[calendly/booked] error:", e && e.stack || e);
+    console.error("[appointments/booked] error:", e && e.stack || e);
     if (!res.headersSent) res.status(500).json({ ok: false, error: e.message || String(e) });
   }
 });
