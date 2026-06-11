@@ -2070,14 +2070,19 @@ async function _coworkSuppressDripsForAppointment(prospect, appt, opts) {
     if (appt && appt.start_time) {
       const pool = await _pgGetPool();
       if (pool) {
+        // Reminder fires DAY-OF at 08:30 ET (Didier 2026-06-11; column names are legacy
+        // "daybefore_*"). If 08:30 already passed when the booking lands (same-day late
+        // booking), mark sent — the confirm SMS just went out, no second text needed.
         await pool.query(
           `INSERT INTO appointment_reminders (prospect_id, email, start_time, daybefore_due, daybefore_sent)
-           VALUES ($1, $2, $3::timestamptz, $3::timestamptz - interval '24 hours', FALSE)
+           VALUES ($1, $2, $3::timestamptz,
+             ((($3::timestamptz AT TIME ZONE 'America/New_York')::date)::timestamp + interval '8 hours 30 minutes') AT TIME ZONE 'America/New_York',
+             ((($3::timestamptz AT TIME ZONE 'America/New_York')::date)::timestamp + interval '8 hours 30 minutes') AT TIME ZONE 'America/New_York' <= now())
            ON CONFLICT (prospect_id) DO UPDATE SET
              email = EXCLUDED.email,
              start_time = EXCLUDED.start_time,
              daybefore_due = EXCLUDED.daybefore_due,
-             daybefore_sent = CASE WHEN appointment_reminders.start_time IS DISTINCT FROM EXCLUDED.start_time THEN FALSE ELSE appointment_reminders.daybefore_sent END`,
+             daybefore_sent = CASE WHEN appointment_reminders.start_time IS DISTINCT FROM EXCLUDED.start_time THEN EXCLUDED.daybefore_sent ELSE appointment_reminders.daybefore_sent END`,
           [String(prospect.id), String(prospect.email || ""), appt.start_time]
         );
         out.actions.push("reminder_scheduled");
@@ -2166,6 +2171,13 @@ async function _coworkFireDueReminders(dryRun) {
   const out = { due: 0, fired: 0, skipped: [], dry_run: !!dryRun };
   const pool = await _pgGetPool();
   if (!pool) { out.skipped.push("no_database_url"); return out; }
+  // Recompute due for unsent rows from the current rule (day-of 08:30 ET) so a rule
+  // change applies to already-scheduled reminders without a migration.
+  await pool.query(
+    `UPDATE appointment_reminders
+     SET daybefore_due = (((start_time AT TIME ZONE 'America/New_York')::date)::timestamp + interval '8 hours 30 minutes') AT TIME ZONE 'America/New_York'
+     WHERE NOT daybefore_sent`
+  );
   const { rows } = await pool.query(
     "SELECT prospect_id, email, start_time FROM appointment_reminders WHERE NOT daybefore_sent AND daybefore_due <= now() AND start_time > now()"
   );
