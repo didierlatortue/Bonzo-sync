@@ -6,7 +6,7 @@ import { createHash as _coworkCreateHash } from "crypto";
 const app = express();
 // Cowork: CORS for /meta/capi from turturhomeloans.com (server-side Meta event from /thanks)
 app.use(function (req, res, next) {
-  if (req.path === "/meta/capi") {
+  if (req.path === "/meta/capi" || req.path.indexOf("/lead/inbound") === 0) {
     var origin = req.headers.origin || "";
     var allow = [
       "https://turturhomeloans.com",
@@ -1506,6 +1506,46 @@ async function _coworkHandleInboundWork(req, preFlat) {
     const first_name = flat.first_name || "";
     const last_name = flat.last_name || "";
 
+    // === COWORK 2026-07-14: durable raw lead log + server-side partial dedupe ===
+    // Partials ("Abandoned Form") historically posted straight to Bonzo's webhook from
+    // page JS; they now come through here. Log EVERY inbound payload to Neon
+    // (lead_events) so no field is ever lost, and suppress duplicate partials:
+    //   - any prior FULL for the same email/lead_id -> lead already completed; never
+    //     re-inject them as abandoned (the didiertest revisit loop, 2026-07-14)
+    //   - a prior PARTIAL for the same email/lead_id within 7 days -> Bonzo already
+    //     has this abandon; don't create another submission
+    const _leadId = (flat.lead_id || "").toString().trim();
+    const _emailLc = email.toLowerCase();
+    const _isPartial = String(flat.lead_status || "") === "Partial" ||
+                       /^Abandoned/i.test(String((flat.lead_source || "")));
+    let _kind = _isPartial ? "partial" : "full";
+    try {
+      if (_isPartial) {
+        const _lePool = await _pgGetPool();
+        if (_lePool) {
+          const dup = await _lePool.query(
+            `SELECT kind FROM lead_events
+             WHERE ( (email IS NOT NULL AND email = $1) OR (lead_id IS NOT NULL AND lead_id = $2) )
+               AND ( kind = 'full' OR (kind = 'partial' AND created_at > now() - interval '7 days') )
+             LIMIT 1`,
+            [_emailLc || null, _leadId || null]
+          );
+          if (dup.rows.length > 0) {
+            _kind = "partial_suppressed";
+            console.log("[lead/inbound] partial suppressed (prior " + dup.rows[0].kind + ") email=" + _emailLc + " lead_id=" + _leadId);
+          }
+        }
+      }
+    } catch (e) { console.warn("[lead/inbound] partial dedupe check failed (continuing):", e && e.message); }
+    try {
+      const _lePool2 = await _pgGetPool();
+      if (_lePool2) await _lePool2.query(
+        "INSERT INTO lead_events (lead_id, email, kind, lead_source, payload) VALUES ($1,$2,$3,$4,$5)",
+        [_leadId || null, _emailLc || null, _kind, String(flat.lead_source || flat.form_name || ""), JSON.stringify(flat)]
+      );
+    } catch (e) { console.warn("[lead/inbound] lead_events insert failed:", e && e.message); }
+    if (_kind === "partial_suppressed") return; // logged; skip Bonzo forward entirely
+
     const bonzoBase = process.env.BONZO_BASE_URL || "https://app.getbonzo.com/api/v3";
     const bonzoToken = process.env.BONZO_TOKEN || process.env.BONZO_API_KEY;
     const headers = {
@@ -1547,7 +1587,11 @@ async function _coworkHandleInboundWork(req, preFlat) {
     // Choose based on the (possibly enriched) lead_source.
     const _ls = (attr.lead_source || "").toString();
     // Cowork 2026-05-11: match all purchase-style funnels (Purchase, FHA, VA, Jumbo, DSCR all live on Purchase Bonzo webhook)
-    const _isPurchase = /Purchase|FHA Form|VA Form|Jumbo|DSCR/i.test(_ls);
+    // Cowork 2026-07-14: partials arrive with generic lead_source "Abandoned Form" —
+    // pick the funnel webhook from the landing page instead (refi/cashout vs purchase family).
+    const _isPurchase = _isPartial
+      ? !/refinance|cashout/i.test(String(attr.landing_page || flat.page_url || ""))
+      : /Purchase|FHA Form|VA Form|Jumbo|DSCR/i.test(_ls);
     const _whRefi = process.env.BONZO_WEBHOOK_REFINANCE_HASH || "ddb05f5431f315e374231b2597e1da01";
     const _whPurch = process.env.BONZO_WEBHOOK_PURCHASE_HASH || "3ec807d03f29ec10046232c3e1a55670";
     const _whHash = _isPurchase ? _whPurch : _whRefi;
@@ -2544,6 +2588,20 @@ async function _pgGetPool() {
   )`);
   await _pgPool.query("CREATE INDEX IF NOT EXISTS google_contacts_phone_idx ON google_contacts(phone_last10) WHERE phone_last10 IS NOT NULL");
   await _pgPool.query("CREATE INDEX IF NOT EXISTS google_contacts_email_idx ON google_contacts(email) WHERE email IS NOT NULL");
+  // === COWORK 2026-07-14: lead_events — durable raw log of every /lead/inbound payload ===
+  // Partials used to post straight to Bonzo's webhook; unmapped fields were lost forever.
+  // Every inbound payload (full + partial) now lands here so nothing is ever unrecoverable.
+  await _pgPool.query(`CREATE TABLE IF NOT EXISTS lead_events (
+    id BIGSERIAL PRIMARY KEY,
+    lead_id TEXT,
+    email TEXT,
+    kind TEXT NOT NULL,
+    lead_source TEXT,
+    payload JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  )`);
+  await _pgPool.query("CREATE INDEX IF NOT EXISTS lead_events_email_idx ON lead_events(email) WHERE email IS NOT NULL");
+  await _pgPool.query("CREATE INDEX IF NOT EXISTS lead_events_lead_id_idx ON lead_events(lead_id) WHERE lead_id IS NOT NULL");
   return _pgPool;
 }
 
