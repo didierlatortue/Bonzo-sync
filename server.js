@@ -2134,6 +2134,76 @@ async function _coworkSuppressDripsForAppointment(prospect, appt, opts) {
     }
   } catch (e) { out.actions.push("reminder_schedule_err:" + (e && e.message || e)); }
 
+  // 6) COWORK 2026-07-27: offline conversion upload for the booked appointment.
+  // WHY: the client-side path (GTM tag 33 -> Ads "Consultation Booked", a WEBPAGE
+  // conversion action) misses roughly a third of paid sessions — Aniyah Wellington
+  // (prospect 131896914, 2026-07-20) booked AND held an appointment off a gbraid/iOS
+  // click and Google Ads recorded nothing at all, because her GTM container never ran.
+  // The ARIVE fan-out in /bonzo/events only fires on stages "Application Completed*"
+  // and "Funded*", so an appointment had no server-side path. This closes that gap for
+  // every detection route at once, because all three (T+ timers, /appointments/booked,
+  // the reconcile cron) funnel through this function.
+  // Guarded by the appt_conv_uploaded tag AND a deterministic order_id, so a re-entry
+  // can neither double-charge the API nor double-count the conversion (MANY_PER_CLICK
+  // dedupes on order_id).
+  try {
+    const _convIdAppt = process.env.GOOGLE_ADS_CONSULTATION_CONV_ID;
+    const _alreadyUploaded = getTagNames(prospect.tags || [])
+      .map(t => String(t).toLowerCase())
+      .indexOf("appt_conv_uploaded") !== -1;
+    if (!_convIdAppt) {
+      out.actions.push("appt_conv_skipped:no_env");
+    } else if (_alreadyUploaded) {
+      out.actions.push("appt_conv_skipped:already_uploaded");
+    } else {
+      const attr = await bonzoGetAttribution(prospect.id, prospect);
+      const _g = attr.gclid || "", _gb = attr.gbraid || "", _wb = attr.wbraid || "";
+      if (!_g && !_gb && !_wb) {
+        // Organic/direct booking — nothing to attribute against. Not an error.
+        out.actions.push("appt_conv_skipped:no_click_id");
+      } else {
+        const fakeReq = {
+          params: { code: process.env.LEAD_INBOUND_CODE },
+          headers: {},
+          header: () => null,
+          body: {
+            gclid: _g, gbraid: _gb, wbraid: _wb,
+            fbclid: attr.fbclid || "",
+            email: prospect.email,
+            phone: prospect.phone,
+            conversion_action_id: _convIdAppt,
+            value: 1,
+            currency: "USD",
+            order_id: "appt-" + prospect.id,
+            meta_event_name: "Schedule",
+            ga4_event_name: null,
+          },
+        };
+        let captured = null;
+        const fakeRes = {
+          status: function (c) { this.code = c; return this; },
+          json: function (j) { captured = j; return this; },
+          send: function () { return this; },
+        };
+        await _coworkHandleAdsUpload(fakeReq, fakeRes);
+        const _ok = !!(captured && captured.ok);
+        out.actions.push("appt_conv_upload:" + (_ok ? "ok" : "failed") +
+          ":" + (captured && captured.http));
+        console.log("[appt-conv] prospect=" + prospect.id +
+          " click_id=" + (_g || _gb || _wb).slice(0, 10) + "\u2026" +
+          " conv=" + _convIdAppt + " ok=" + _ok +
+          " google_http=" + (captured && captured.http) +
+          " meta_status=" + (captured && captured.meta_capi && captured.meta_capi.status));
+        if (_ok) {
+          try { await bonzoUpdateProspect(prospect.id, { tags: ["appt_conv_uploaded"] }); } catch (e) {}
+        }
+      }
+    }
+  } catch (e) {
+    out.actions.push("appt_conv_err:" + (e && e.message || e));
+    console.warn("[appt-conv] error:", e && e.message);
+  }
+
   return out;
 }
 
