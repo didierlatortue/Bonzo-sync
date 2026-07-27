@@ -2491,11 +2491,18 @@ async function _coworkHandleAdsUpload(req, res) {
       ((b.past_client === true || b.past_client === "true" || b.past_client === 1) && _pcConvId
         ? _pcConvId
         : process.env.GOOGLE_ADS_FUNDED_LOAN_CONV_ID);
-    const convResource = "customers/" + process.env.GOOGLE_ADS_CUSTOMER_ID +
+    // COWORK 2026-07-27: the env vars hold the DASHED form ("713-042-5397" /
+    // "317-080-1905") but the API requires digits only — v21 rejects dashes with
+    // INVALID_CUSTOMER_ID. The customer-match helper above already strips them
+    // (cleanCid/cleanMcc); this path did not, so every uploadClickConversions call
+    // was malformed. Normalize here too.
+    const _cleanCid = String(process.env.GOOGLE_ADS_CUSTOMER_ID || "").replace(/-/g, "");
+    const _cleanMcc = String(process.env.GOOGLE_ADS_MCC_ID || "").replace(/-/g, "");
+    const convResource = "customers/" + _cleanCid +
       "/conversionActions/" + _convId;
     const access = await _coworkGetAdsToken();
     const url = "https://googleads.googleapis.com/v21/customers/" +
-      process.env.GOOGLE_ADS_CUSTOMER_ID + ":uploadClickConversions";
+      _cleanCid + ":uploadClickConversions";
     const _conv = {
       conversionAction: convResource,
       conversionDateTime: ct,
@@ -2518,7 +2525,7 @@ async function _coworkHandleAdsUpload(req, res) {
       headers: {
         "Authorization": "Bearer " + access,
         "developer-token": process.env.GOOGLE_ADS_DEVELOPER_TOKEN,
-        "login-customer-id": process.env.GOOGLE_ADS_MCC_ID,
+        "login-customer-id": _cleanMcc,
         "Content-Type": "application/json"
       },
       body: JSON.stringify(payload)
