@@ -2410,7 +2410,7 @@ async function _googleCustomerMatchUpload(cache) {
   if (!token) return { error: 'no token' };
   const cleanCid = String(cid).replace(/-/g, '');
   const cleanMcc = String(mcc).replace(/-/g, '');
-  const apiBase = 'https://googleads.googleapis.com/v20/customers/' + cleanCid;
+  const apiBase = 'https://googleads.googleapis.com/v21/customers/' + cleanCid;
   const headers = {
     'Authorization': 'Bearer ' + token,
     'developer-token': dt,
@@ -2446,7 +2446,7 @@ async function _googleCustomerMatchUpload(cache) {
   let lastError = null;
   for (let i = 0; i < operations.length; i += BATCH) {
     const batch = operations.slice(i, i + BATCH);
-    const addResp = await fetch('https://googleads.googleapis.com/v20/' + resourceName + ':addOperations', {
+    const addResp = await fetch('https://googleads.googleapis.com/v21/' + resourceName + ':addOperations', {
       method: 'POST', headers, body: JSON.stringify({ operations: batch, enablePartialFailure: true })
     });
     if (addResp.ok) {
@@ -2457,7 +2457,7 @@ async function _googleCustomerMatchUpload(cache) {
     }
   }
   if (lastError) return { resource: resourceName, operations_added: totalAdded, error: lastError };
-  const runResp = await fetch('https://googleads.googleapis.com/v20/' + resourceName + ':run', {
+  const runResp = await fetch('https://googleads.googleapis.com/v21/' + resourceName + ':run', {
     method: 'POST', headers, body: '{}'
   });
   return { resource: resourceName, operations_added: totalAdded, list_id: listId, run_status: runResp.status };
@@ -2494,7 +2494,7 @@ async function _coworkHandleAdsUpload(req, res) {
     const convResource = "customers/" + process.env.GOOGLE_ADS_CUSTOMER_ID +
       "/conversionActions/" + _convId;
     const access = await _coworkGetAdsToken();
-    const url = "https://googleads.googleapis.com/v20/customers/" +
+    const url = "https://googleads.googleapis.com/v21/customers/" +
       process.env.GOOGLE_ADS_CUSTOMER_ID + ":uploadClickConversions";
     const _conv = {
       conversionAction: convResource,
