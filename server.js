@@ -1589,9 +1589,16 @@ async function _coworkHandleInboundWork(req, preFlat) {
     // Cowork 2026-05-11: match all purchase-style funnels (Purchase, FHA, VA, Jumbo, DSCR all live on Purchase Bonzo webhook)
     // Cowork 2026-07-14: partials arrive with generic lead_source "Abandoned Form" —
     // pick the funnel webhook from the landing page instead (refi/cashout vs purchase family).
+    // Cowork 2026-08-10: "First-Time Homebuyer Form" is a PURCHASE funnel but did not
+    // match the old regex, so every FTHB lead (Aniyah 7/20, Alston 7/31, Jessica 8/10)
+    // was forwarded to the Refinance webhook and never reached a campaign branch.
+    // Match on the landing page as well as lead_source so new purchase-family funnels
+    // fail toward Purchase instead of silently landing on Refi.
+    const _purchaseRe = /Purchase|FHA|VA Form|Jumbo|DSCR|First[-\s]?Time|Homebuyer|Home Buyer/i;
+    const _pageStr = String(attr.landing_page || flat.page_url || flat["Page URL"] || "");
     const _isPurchase = _isPartial
-      ? !/refinance|cashout/i.test(String(attr.landing_page || flat.page_url || ""))
-      : /Purchase|FHA Form|VA Form|Jumbo|DSCR/i.test(_ls);
+      ? !/refinance|cashout/i.test(_pageStr)
+      : (_purchaseRe.test(_ls) || /first-time-homebuyer|purchase|fha|va-loan|jumbo/i.test(_pageStr));
     const _whRefi = process.env.BONZO_WEBHOOK_REFINANCE_HASH || "ddb05f5431f315e374231b2597e1da01";
     const _whPurch = process.env.BONZO_WEBHOOK_PURCHASE_HASH || "3ec807d03f29ec10046232c3e1a55670";
     const _whHash = _isPurchase ? _whPurch : _whRefi;
@@ -1636,15 +1643,32 @@ async function _coworkHandleInboundWork(req, preFlat) {
         console.error("Webhook forward failed", wr.status, t.slice(0, 400));
       } else {
         action = "forwarded_to_webhook";
-        // Resolve prospect id by lookup (webhook is async, so we re-search)
-        await new Promise(r => setTimeout(r, 1500));
-        if (email) {
-          const found = await _findBy(email, "email");
-          if (found) prospectId = found.id;
+        // Resolve prospect id by lookup (webhook is async, so we re-search).
+        // Cowork 2026-08-10: was a single hard-coded 1500ms sleep + one search.
+        // When Bonzo's async webhook write took longer than that, the search
+        // missed and we fell through to the REST create below — which bypasses
+        // the webhook's pipeline_stage_id and kills ALL downstream routing
+        // (Connie Darity 7/28, Jessica Sapin 8/10). Poll instead.
+        const _pollMs = Number(process.env.BONZO_WEBHOOK_POLL_MS || 1000);
+        const _pollMax = Number(process.env.BONZO_WEBHOOK_POLL_TRIES || 10);
+        for (let _try = 1; _try <= _pollMax && !prospectId; _try++) {
+          await new Promise(r => setTimeout(r, _pollMs));
+          if (email) {
+            const found = await _findBy(email, "email");
+            if (found) prospectId = found.id;
+          }
+          if (!prospectId && phone) {
+            const found = await _findBy(phone, "phone");
+            if (found) prospectId = found.id;
+          }
+          if (prospectId) {
+            console.log("[lead/inbound] webhook prospect resolved id=" + prospectId +
+                        " after " + (_try * _pollMs) + "ms (try " + _try + "/" + _pollMax + ")");
+          }
         }
-        if (!prospectId && phone) {
-          const found = await _findBy(phone, "phone");
-          if (found) prospectId = found.id;
+        if (!prospectId) {
+          console.error("[lead/inbound] webhook forward OK but prospect NOT found after " +
+                        (_pollMax * _pollMs) + "ms — falling back to REST create");
         }
       }
     } catch (e) {
@@ -1678,6 +1702,28 @@ async function _coworkHandleInboundWork(req, preFlat) {
           const t = await r.text();
           console.error("POST prospect fallback failed", r.status, t.slice(0, 500));
           return res.status(502).json({ ok: false, error: "bonzo_create_failed", status: r.status, body: t.slice(0, 300), webhook_status: _whStatus });
+        }
+      }
+
+      // Cowork 2026-08-10: make the REST fallback ROUTE-EQUIVALENT to the webhook.
+      // A REST-created prospect never gets the webhook's pipeline_stage_id, so it
+      // silently skips Lead Entered and every downstream automation. Assign the
+      // stage ourselves so a fallback create is no longer a dead end.
+      // Only on a fresh create — never re-stage an existing prospect (would re-fire
+      // the Lead Entered chain for repeat submitters / partials).
+      if (action === "created_rest_fallback" && prospectId) {
+        const _leadStage = Number(process.env.BONZO_LEAD_ENTERED_STAGE_ID || 420176);
+        try {
+          const sr = await fetch(`${bonzoBase}/prospects/${prospectId}/pipeline-stage/${_leadStage}`,
+                                 { method: "POST", headers });
+          console.log("[lead/inbound] REST-fallback stage assign prospect=" + prospectId +
+                      " stage=" + _leadStage + " status=" + sr.status);
+          if (!sr.ok) {
+            const st = await sr.text();
+            console.error("[lead/inbound] REST-fallback stage assign FAILED", sr.status, st.slice(0, 300));
+          }
+        } catch (e) {
+          console.error("[lead/inbound] REST-fallback stage assign exception", e && e.message);
         }
       }
     }
@@ -2372,6 +2418,62 @@ app.post("/appointments/reconcile/:code", express.json({ limit: "256kb" }), asyn
   }
 });
 // === END COWORK 2026-06-11 APPOINTMENT SUPPRESSION ===
+
+
+// === COWORK 2026-08-10: unrouted-lead safety net ===
+// Backstop for the Connie Darity (7/28) / Jessica Sapin (8/10) failure mode: a lead
+// reaches Bonzo with every field mapped but never attaches to a pipeline stage, so no
+// automation ever fires. Finds recent prospects that came from a real lead form but
+// have no pipeline stage, and assigns Lead Entered (420176) so the normal chain runs.
+// Called from GHA cron. Defaults to dry_run — pass ?dry_run=false to act.
+const TURTUR_LEAD_ENTERED_STAGE_ID = Number(process.env.BONZO_LEAD_ENTERED_STAGE_ID || 420176);
+const TURTUR_ROUTING_LEAD_SOURCE_RE =
+  /Purchase|Refinance|Cashout|Cash[-\s]?Out|HELOC|FHA|VA Form|Jumbo|DSCR|First[-\s]?Time|Homebuyer|Home Buyer|Abandoned/i;
+
+app.post("/leads/reconcile-unrouted/:code", express.json({ limit: "256kb" }), async (req, res) => {
+  if (req.params.code !== process.env.LEAD_INBOUND_CODE) return res.status(401).json({ ok: false, error: "Unauthorized" });
+  try {
+    const dryRun = req.query.dry_run !== "false";
+    const hours = Math.min(parseInt(req.query.hours, 10) || 24, 168);
+    const maxFix = Math.min(parseInt(req.query.limit, 10) || 10, 25);
+    const cutoff = Date.now() - hours * 3600 * 1000;
+    const candidates = [];
+    for (let page = 1; page <= 3; page++) {
+      const r = await bonzoFetch("/prospects?per_page=100&page=" + page, { method: "GET" });
+      const data = (r && r.json && r.json.data) || [];
+      if (!data.length) break;
+      let allOlder = true;
+      for (const p of data) {
+        const t = p.created_at ? new Date(p.created_at).getTime() : 0;
+        if (t >= cutoff) allOlder = false; else continue;
+        // Only leads that came from a real form funnel — never CSV imports,
+        // incoming calls, or manually-added contacts.
+        const ls = String((p.mortgage && p.mortgage.lead_source) || "");
+        if (!TURTUR_ROUTING_LEAD_SOURCE_RE.test(ls)) continue;
+        // Already routed? leave it alone.
+        if (p.pipeline_stage && p.pipeline_stage.id) continue;
+        if ((p.campaigns || []).length) continue;
+        candidates.push({ id: p.id, email: p.email, lead_source: ls, created_at: p.created_at });
+      }
+      if (allOlder) break;
+    }
+    const results = [];
+    for (const c of candidates.slice(0, maxFix)) {
+      if (dryRun) { results.push({ ...c, action: "would_assign", stage: TURTUR_LEAD_ENTERED_STAGE_ID }); continue; }
+      try {
+        const r = await bonzoFetch("/prospects/" + c.id + "/pipeline-stage/" + TURTUR_LEAD_ENTERED_STAGE_ID, { method: "POST" });
+        results.push({ ...c, action: "assigned", stage: TURTUR_LEAD_ENTERED_STAGE_ID, status: r && r.status });
+        console.log("[reconcile-unrouted] assigned prospect=" + c.id + " stage=" + TURTUR_LEAD_ENTERED_STAGE_ID + " ls=" + c.lead_source);
+      } catch (e) {
+        results.push({ ...c, action: "error", error: e && e.message || String(e) });
+      }
+    }
+    res.json({ ok: true, dry_run: dryRun, window_hours: hours, unrouted: candidates.length, acted: results.length, results });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message || String(e) });
+  }
+});
+// === END COWORK 2026-08-10 UNROUTED-LEAD SAFETY NET ===
 
 
 // === COWORK 2026-04-29: /google-ads/upload-conversion ===

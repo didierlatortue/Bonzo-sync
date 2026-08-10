@@ -1,0 +1,32 @@
+name: reconcile-unrouted-leads
+# Safety net for the Connie Darity (2026-07-28) / Jessica Sapin (2026-08-10)
+# failure mode: a form lead lands in Bonzo with every field mapped but never gets
+# attached to a pipeline stage, so NO automation fires and nobody notices.
+#
+# Sweeps prospects created in the last 24h that have a real lead-form lead_source
+# but no pipeline stage and no campaign, and assigns Lead Entered (420176) so the
+# normal Got Lead routing chain runs.
+#
+# Runs every 30 min. Also acts as a bonzo-sync keepalive on Render Free tier.
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "true = report only, false = actually assign the stage"
+        required: false
+        default: "false"
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Hit unrouted-lead reconcile endpoint
+        run: |
+          DRY="${{ github.event.inputs.dry_run }}"
+          if [ -z "$DRY" ]; then DRY="false"; fi
+          curl -sS -X POST \
+            "https://bonzo-sync.onrender.com/leads/reconcile-unrouted/${{ secrets.LEAD_INBOUND_CODE }}?dry_run=$DRY&hours=24&limit=10" \
+            --max-time 180 | head -c 4000
