@@ -2704,13 +2704,13 @@ async function _coworkHandleAdsUpload(req, res) {
     // INVALID_CUSTOMER_ID. The customer-match helper above already strips them
     // (cleanCid/cleanMcc); this path did not, so every uploadClickConversions call
     // was malformed. Normalize here too.
-    const _cleanCid = String(process.env.GOOGLE_ADS_CUSTOMER_ID || "").replace(/-/g, "");
-    const _cleanMcc = String(process.env.GOOGLE_ADS_MCC_ID || "").replace(/-/g, "");
-    const convResource = "customers/" + _cleanCid +
-      "/conversionActions/" + _convId;
+    // Shared with the health canary — see _coworkAdsUploadTarget.
+    const _tgt = await _coworkAdsUploadTarget(_convId);
+    const _cleanCid = _tgt.cid;
+    const _cleanMcc = _tgt.mcc;
+    const convResource = _tgt.convResource;
     const access = await _coworkGetAdsToken();
-    const url = "https://googleads.googleapis.com/" + (await _adsApiVersion()) + "/customers/" +
-      _cleanCid + ":uploadClickConversions";
+    const url = _tgt.url;
     const _conv = {
       conversionAction: convResource,
       conversionDateTime: ct,
@@ -3093,10 +3093,34 @@ app.post("/customer-match/upload/:code", express.json({limit: "50mb"}), async fu
 //
 // Silent when healthy. The GHA workflow turns ok:false into a failed run, which is
 // what actually reaches a human.
+// === COWORK 2026-08-12: single source of truth for the Ads upload target ===
+// The health canary MUST build its request through the same code as the real
+// uploader, or it only proves its own copy of the logic works. Found the hard
+// way: the first version of the canary stripped the dashes from the customer id
+// itself, so it could not reproduce the 2026-07-27 dashed-id defect at all — it
+// reported healthy against a deliberately broken env. Anything that determines
+// WHERE an upload goes or HOW it is addressed belongs in here, used by both.
+async function _coworkAdsUploadTarget(convId) {
+  const cid = String(process.env.GOOGLE_ADS_CUSTOMER_ID || "").replace(/-/g, "");
+  const mcc = String(process.env.GOOGLE_ADS_MCC_ID || "").replace(/-/g, "");
+  const version = await _adsApiVersion();
+  const access = await _coworkGetAdsToken();
+  return {
+    version, cid, mcc,
+    url: "https://googleads.googleapis.com/" + version + "/customers/" + cid + ":uploadClickConversions",
+    searchUrl: "https://googleads.googleapis.com/" + version + "/customers/" + cid + "/googleAds:search",
+    convResource: "customers/" + cid + "/conversionActions/" + convId,
+    headers: {
+      "Authorization": "Bearer " + access,
+      "developer-token": process.env.GOOGLE_ADS_DEVELOPER_TOKEN,
+      "login-customer-id": mcc,
+      "Content-Type": "application/json",
+    },
+  };
+}
+
 async function _coworkConversionHealth() {
   const out = { ok: true, checked_at: new Date().toISOString(), failures: [], warnings: [] };
-  const cleanCid = String(process.env.GOOGLE_ADS_CUSTOMER_ID || "").replace(/-/g, "");
-  const cleanMcc = String(process.env.GOOGLE_ADS_MCC_ID || "").replace(/-/g, "");
 
   const CONV = [
     { key: "funded_loan",           id: process.env.GOOGLE_ADS_FUNDED_LOAN_CONV_ID },
@@ -3132,33 +3156,34 @@ async function _coworkConversionHealth() {
     out.warnings.push("api_version_unverified: " + _adsVerState.detail);
   }
 
-  let access;
+  // Build the target through the SAME function the real uploader uses, so a
+  // regression there (e.g. an un-normalised customer id) fails this check.
+  const canaryConvId = (CONV.find(c => c.id) || {}).id;
+  let tgt;
   try {
-    access = await _coworkGetAdsToken();
+    tgt = await _coworkAdsUploadTarget(canaryConvId);
   } catch (e) {
     out.ok = false;
-    out.failures.push("oauth_refresh_failed: " + (e && e.message));
+    out.failures.push("upload_target_build_failed: " + (e && e.message));
     return out;
   }
-  const H = {
-    "Authorization": "Bearer " + access,
-    "developer-token": process.env.GOOGLE_ADS_DEVELOPER_TOKEN,
-    "login-customer-id": cleanMcc,
-    "Content-Type": "application/json",
-  };
+  const H = tgt.headers;
+  out.target = { customer_id: tgt.cid, login_customer_id: tgt.mcc, url: tgt.url };
+  // Catch a malformed target before Google does, so the failure names itself.
+  if (!/^\d+$/.test(tgt.cid)) { out.ok = false; out.failures.push("customer_id_not_normalised: '" + tgt.cid + "' — must be digits only (this is the 2026-07-27 defect)"); }
+  if (!/^\d+$/.test(tgt.mcc)) { out.ok = false; out.failures.push("login_customer_id_not_normalised: '" + tgt.mcc + "'"); }
 
   // --- 2. upload-path canary (validateOnly, Google only, no Meta) ---
-  const canaryConv = (CONV.find(c => c.id) || {}).id;
-  if (!canaryConv) {
+  if (!canaryConvId) {
     out.ok = false;
     out.failures.push("no_conversion_action_env_vars_set");
   } else {
     try {
-      const r = await fetch("https://googleads.googleapis.com/" + ver + "/customers/" + cleanCid + ":uploadClickConversions", {
+      const r = await fetch(tgt.url, {
         method: "POST", headers: H,
         body: JSON.stringify({
           conversions: [{
-            conversionAction: "customers/" + cleanCid + "/conversionActions/" + canaryConv,
+            conversionAction: tgt.convResource,
             conversionDateTime: _coworkAdsNowStamp(),
             conversionValue: 1, currencyCode: "USD",
             orderId: "healthcheck-canary-do-not-count",
@@ -3208,7 +3233,7 @@ async function _coworkConversionHealth() {
     const ids = CONV.filter(c => c.id).map(c => c.id);
     const q = "SELECT conversion_action.id, conversion_action.name, conversion_action.status, " +
               "conversion_action.type FROM conversion_action WHERE conversion_action.id IN (" + ids.join(",") + ")";
-    const r = await fetch("https://googleads.googleapis.com/" + ver + "/customers/" + cleanCid + "/googleAds:search", {
+    const r = await fetch(tgt.searchUrl, {
       method: "POST", headers: H, body: JSON.stringify({ query: q }),
     });
     const txt = await r.text();
