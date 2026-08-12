@@ -1,0 +1,72 @@
+name: conversion-health
+# Daily check that the offline-conversion upload path to Google Ads still works.
+#
+# WHY: uploads have died silently three times (dead API v20 and a dashed customer
+# id on 2026-07-27, dead API v21 on 2026-08-12). Each time everything looked fine
+# and conversions were simply not arriving. The version resolver in server.js
+# catches a retired API version on its own; this catches the rest — broken auth,
+# a malformed customer id, a conversion action that got paused, renamed or
+# deleted — by firing a real validateOnly upload and inspecting which error
+# Google returns.
+#
+# This job is SILENT when healthy. It fails the workflow run when it is not,
+# which is what actually reaches a human (GitHub emails the repo owner on a
+# failed run). Do not "fix" a red run by relaxing the check — a red run here
+# means paid-conversion reporting is broken.
+#
+# Runs entirely in the cloud. Nothing here depends on the Mac being awake.
+on:
+  schedule:
+    - cron: "0 13 * * *"   # 09:00 ET daily
+  workflow_dispatch: {}
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: Query conversion health
+        run: |
+          echo "Calling /health/conversions ..."
+          # Render free tier cold-starts (~20-30s); allow for the wake.
+          CODE=$(curl -sS -o /tmp/health.json -w "%{http_code}" \
+            "https://bonzo-sync.onrender.com/health/conversions/${{ secrets.LEAD_INBOUND_CODE }}" \
+            --max-time 180 --retry 2 --retry-delay 15 --retry-connrefused || echo "000")
+
+          echo "HTTP $CODE"
+          echo "--- response ---"
+          cat /tmp/health.json 2>/dev/null | head -c 4000
+          echo ""
+          echo "----------------"
+
+          if [ "$CODE" != "200" ]; then
+            echo ""
+            echo "::error::Offline conversion pipeline is UNHEALTHY (HTTP $CODE)."
+            python3 - <<'PY' 2>/dev/null || true
+          import json
+          try:
+              d = json.load(open('/tmp/health.json'))
+              for f in d.get('failures', []):
+                  print("::error::" + f)
+              av = d.get('api_version') or {}
+              print("::error::api version resolved=%s pinned=%s state=%s"
+                    % (av.get('resolved'), av.get('pinned'), av.get('state')))
+          except Exception as e:
+              print("::error::could not parse health response: %s" % e)
+          PY
+            exit 1
+          fi
+
+          # Healthy, but surface non-fatal notes (e.g. the resolver auto-advanced
+          # and the code pin should be updated) as annotations, not failures.
+          python3 - <<'PY' 2>/dev/null || true
+          import json
+          try:
+              d = json.load(open('/tmp/health.json'))
+              for w in d.get('warnings', []):
+                  print("::warning::" + w)
+          except Exception:
+              pass
+          PY
+
+          echo "Conversion pipeline healthy."

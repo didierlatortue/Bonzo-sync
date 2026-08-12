@@ -2518,6 +2518,10 @@ const ADS_VER_KNOWN_GOOD = process.env.GOOGLE_ADS_API_VERSION || "v22";
 const ADS_VER_CEILING    = parseInt(process.env.GOOGLE_ADS_API_VERSION_MAX || "40", 10);
 const ADS_VER_TTL_MS     = 12 * 60 * 60 * 1000;
 let _adsVerCache = { version: null, at: 0 };
+// Populated by _adsApiVersion() so /health/conversions can report the resolver's
+// verdict without re-probing. state: "verified" | "auto_advanced" | "climb_failed"
+//                                   | "inconclusive" | "resolver_error"
+let _adsVerState = { state: null, pinned: ADS_VER_KNOWN_GOOD, resolved: null, at: 0, detail: null };
 
 // true = alive · false = definitively retired/nonexistent · null = inconclusive
 async function _adsProbeVersion(v, access) {
@@ -2566,6 +2570,7 @@ async function _adsApiVersion() {
     const good = await _adsProbeStable(ADS_VER_KNOWN_GOOD, access);
     if (good === true) {
       console.log("[ads-version] using " + chosen + " (known-good, verified alive)");
+      _adsVerState = { state: "verified", pinned: ADS_VER_KNOWN_GOOD, resolved: chosen, at: now, detail: null };
     } else if (good === false) {
       let n = parseInt(String(ADS_VER_KNOWN_GOOD).replace(/\D/g, ""), 10);
       let found = null;
@@ -2579,15 +2584,23 @@ async function _adsApiVersion() {
         console.error("[ads-version] 🔴 " + ADS_VER_KNOWN_GOOD + " is RETIRED — auto-advanced to " + found +
           ". Uploads are still flowing. Set GOOGLE_ADS_API_VERSION=" + found +
           " on Render and update ADS_VER_KNOWN_GOOD in server.js to make it permanent.");
+        _adsVerState = { state: "auto_advanced", pinned: ADS_VER_KNOWN_GOOD, resolved: found, at: now,
+          detail: "pin " + ADS_VER_KNOWN_GOOD + " is retired; running on " + found + ". Update the pin in code." };
       } else {
         console.error("[ads-version] 🔴 " + ADS_VER_KNOWN_GOOD + " is RETIRED and no working successor was found up to v" +
           ADS_VER_CEILING + " — offline conversion uploads WILL FAIL until this is fixed by hand.");
+        _adsVerState = { state: "climb_failed", pinned: ADS_VER_KNOWN_GOOD, resolved: chosen, at: now,
+          detail: "pin is retired and no working successor found up to v" + ADS_VER_CEILING };
       }
     } else {
       console.warn("[ads-version] probe inconclusive — proceeding on " + chosen + " unverified");
+      _adsVerState = { state: "inconclusive", pinned: ADS_VER_KNOWN_GOOD, resolved: chosen, at: now,
+        detail: "probe could not reach a verdict (auth/quota/network) — version NOT confirmed" };
     }
   } catch (e) {
     console.error("[ads-version] resolver error, falling back to " + chosen + ": " + (e && e.message));
+    _adsVerState = { state: "resolver_error", pinned: ADS_VER_KNOWN_GOOD, resolved: chosen, at: now,
+      detail: String(e && e.message) };
   }
   _adsVerCache = { version: chosen, at: now };
   return chosen;
@@ -3053,6 +3066,200 @@ app.post("/customer-match/upload/:code", express.json({limit: "50mb"}), async fu
 });
 
 // GET /customer-match/status/:code — health/diagnostic
+// === COWORK 2026-08-12: /health/conversions — automatic offline-conversion health check ===
+//
+// WHY THIS EXISTS. Offline conversion uploads have failed silently three times
+// (dead API v20 7/27, dashed customer id 7/27, dead v21 8/12). Every one of them
+// returned a healthy-looking response somewhere and produced zero conversions.
+// The version resolver added 8/12 catches ONLY "the version is retired" — it
+// cannot catch a malformed customer id, broken auth, or a conversion action that
+// was paused or deleted. This endpoint exercises the whole upload path instead.
+//
+// THE CANARY TRICK: fire a real uploadClickConversions with validateOnly:true and
+// a deliberately synthetic click id. Google validates the click id LAST, so:
+//   - reaching UNPARSEABLE_GCLID/UNPARSEABLE_GBRAID == everything before it is
+//     correct (version, customer id, auth, login-customer-id, payload shape) = PASS
+//   - ANY other error (requestError / authenticationError / other upload error)
+//     means the pipeline is broken = FAIL
+// Verified against the live API 2026-08-12: dead version -> UNSUPPORTED_VERSION,
+// dashed cid -> INVALID_CUSTOMER_ID, wrong MCC -> CUSTOMER_NOT_FOUND.
+//
+// DELIBERATELY DOES NOT REUSE _coworkHandleAdsUpload: that handler fires Meta CAPI
+// unconditionally with no suppression flag, so health-checking through it would
+// send junk Meta events forever. This talks to Google only.
+//
+// Conversion actions are checked separately (the canary can't reach them, because
+// the click id is rejected first).
+//
+// Silent when healthy. The GHA workflow turns ok:false into a failed run, which is
+// what actually reaches a human.
+async function _coworkConversionHealth() {
+  const out = { ok: true, checked_at: new Date().toISOString(), failures: [], warnings: [] };
+  const cleanCid = String(process.env.GOOGLE_ADS_CUSTOMER_ID || "").replace(/-/g, "");
+  const cleanMcc = String(process.env.GOOGLE_ADS_MCC_ID || "").replace(/-/g, "");
+
+  const CONV = [
+    { key: "funded_loan",           id: process.env.GOOGLE_ADS_FUNDED_LOAN_CONV_ID },
+    { key: "funded_loan_past_client", id: process.env.GOOGLE_ADS_FUNDED_LOAN_PAST_CLIENT_CONV_ID },
+    { key: "qualified_application", id: process.env.GOOGLE_ADS_QUALIFIED_APPLICATION_CONV_ID },
+    { key: "consultation_booked",   id: process.env.GOOGLE_ADS_CONSULTATION_CONV_ID },
+  ];
+
+  // --- 1. version resolver verdict ---
+  let ver;
+  try {
+    ver = await _adsApiVersion();
+  } catch (e) {
+    out.ok = false;
+    out.failures.push("version_resolver_threw: " + (e && e.message));
+    out.api_version = { state: "threw", detail: String(e && e.message) };
+    return out;
+  }
+  out.api_version = {
+    resolved: ver,
+    pinned: _adsVerState.pinned,
+    state: _adsVerState.state,
+    detail: _adsVerState.detail,
+  };
+  if (_adsVerState.state === "climb_failed" || _adsVerState.state === "resolver_error") {
+    out.ok = false;
+    out.failures.push("api_version_" + _adsVerState.state + ": " + _adsVerState.detail);
+  } else if (_adsVerState.state === "auto_advanced") {
+    // Uploads are still flowing — this is the resolver succeeding. Not a failure,
+    // but it is code debt: every cold boot re-does the climb until the pin moves.
+    out.warnings.push("api_version_auto_advanced: " + _adsVerState.detail);
+  } else if (_adsVerState.state === "inconclusive") {
+    out.warnings.push("api_version_unverified: " + _adsVerState.detail);
+  }
+
+  let access;
+  try {
+    access = await _coworkGetAdsToken();
+  } catch (e) {
+    out.ok = false;
+    out.failures.push("oauth_refresh_failed: " + (e && e.message));
+    return out;
+  }
+  const H = {
+    "Authorization": "Bearer " + access,
+    "developer-token": process.env.GOOGLE_ADS_DEVELOPER_TOKEN,
+    "login-customer-id": cleanMcc,
+    "Content-Type": "application/json",
+  };
+
+  // --- 2. upload-path canary (validateOnly, Google only, no Meta) ---
+  const canaryConv = (CONV.find(c => c.id) || {}).id;
+  if (!canaryConv) {
+    out.ok = false;
+    out.failures.push("no_conversion_action_env_vars_set");
+  } else {
+    try {
+      const r = await fetch("https://googleads.googleapis.com/" + ver + "/customers/" + cleanCid + ":uploadClickConversions", {
+        method: "POST", headers: H,
+        body: JSON.stringify({
+          conversions: [{
+            conversionAction: "customers/" + cleanCid + "/conversionActions/" + canaryConv,
+            conversionDateTime: _coworkAdsNowStamp(),
+            conversionValue: 1, currencyCode: "USD",
+            orderId: "healthcheck-canary-do-not-count",
+            gclid: "HEALTHCHECK0CANARY0NOT0A0REAL0CLICK",
+          }],
+          partialFailure: true,
+          validateOnly: true,
+        }),
+      });
+      const txt = await r.text();
+      let j; try { j = JSON.parse(txt); } catch { j = { raw: txt.slice(0, 400) }; }
+      const codes = [];
+      const pf = j && j.partialFailureError;
+      if (pf && Array.isArray(pf.details)) {
+        for (const d of pf.details) for (const e of (d.errors || [])) codes.push(JSON.stringify(e.errorCode || {}));
+      }
+      if (!r.ok) {
+        const top = [];
+        try { for (const e of j.error.details[0].errors) top.push(JSON.stringify(e.errorCode || {})); } catch {}
+        out.ok = false;
+        out.failures.push("upload_path_http_" + r.status + ": " + (top.join(",") || txt.slice(0, 200)));
+        out.upload_path = { ok: false, http: r.status, errors: top };
+      } else {
+        const benign = codes.length > 0 && codes.every(c => c.indexOf("UNPARSEABLE_GCLID") > -1 || c.indexOf("UNPARSEABLE_GBRAID") > -1);
+        if (benign) {
+          out.upload_path = { ok: true, http: 200, reached: "click_id_validation" };
+        } else if (codes.length === 0) {
+          // No error at all on a fake click id would be surprising, but it is not a
+          // failure of the upload path — flag it rather than crying wolf.
+          out.upload_path = { ok: true, http: 200, reached: "no_error_returned" };
+          out.warnings.push("canary_returned_no_error_unexpected");
+        } else {
+          out.ok = false;
+          out.failures.push("upload_path_unexpected_errors: " + codes.join(","));
+          out.upload_path = { ok: false, http: 200, errors: codes };
+        }
+      }
+    } catch (e) {
+      out.ok = false;
+      out.failures.push("upload_path_threw: " + (e && e.message));
+      out.upload_path = { ok: false, error: String(e && e.message) };
+    }
+  }
+
+  // --- 3. every configured conversion action exists, is ENABLED, accepts uploads ---
+  try {
+    const ids = CONV.filter(c => c.id).map(c => c.id);
+    const q = "SELECT conversion_action.id, conversion_action.name, conversion_action.status, " +
+              "conversion_action.type FROM conversion_action WHERE conversion_action.id IN (" + ids.join(",") + ")";
+    const r = await fetch("https://googleads.googleapis.com/" + ver + "/customers/" + cleanCid + "/googleAds:search", {
+      method: "POST", headers: H, body: JSON.stringify({ query: q }),
+    });
+    const txt = await r.text();
+    if (!r.ok) {
+      out.ok = false;
+      out.failures.push("conversion_action_query_http_" + r.status + ": " + txt.slice(0, 200));
+    } else {
+      const rows = (JSON.parse(txt).results || []).map(x => x.conversionAction || {});
+      const byId = {};
+      for (const row of rows) byId[String(row.id)] = row;
+      out.conversion_actions = CONV.filter(c => c.id).map(function (c) {
+        const row = byId[String(c.id)];
+        const rec = { key: c.key, id: c.id, name: row && row.name, status: row && row.status, type: row && row.type, ok: true };
+        if (!row) { rec.ok = false; out.ok = false; out.failures.push("conversion_action_missing: " + c.key + " (" + c.id + ")"); }
+        else if (row.status !== "ENABLED") { rec.ok = false; out.ok = false; out.failures.push("conversion_action_not_enabled: " + c.key + " is " + row.status); }
+        else if (row.type !== "UPLOAD_CLICKS") { rec.ok = false; out.ok = false; out.failures.push("conversion_action_wrong_type: " + c.key + " is " + row.type + ", uploads need UPLOAD_CLICKS"); }
+        return rec;
+      });
+    }
+  } catch (e) {
+    out.ok = false;
+    out.failures.push("conversion_action_check_threw: " + (e && e.message));
+  }
+
+  return out;
+}
+
+// RFC3339 with offset, as Google requires ("YYYY-MM-DD HH:mm:ss-04:00").
+function _coworkAdsNowStamp() {
+  const d = new Date();
+  const pad = n => String(n).padStart(2, "0");
+  const tz = -d.getTimezoneOffset();
+  const sign = tz >= 0 ? "+" : "-";
+  return d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate()) + " " +
+         pad(d.getHours()) + ":" + pad(d.getMinutes()) + ":" + pad(d.getSeconds()) +
+         sign + pad(Math.floor(Math.abs(tz) / 60)) + ":" + pad(Math.abs(tz) % 60);
+}
+
+app.get("/health/conversions/:code", async function (req, res) {
+  if (req.params.code !== process.env.LEAD_INBOUND_CODE) return res.status(403).json({ ok: false, error: "bad code" });
+  try {
+    const h = await _coworkConversionHealth();
+    if (!h.ok) console.error("[health/conversions] UNHEALTHY:", JSON.stringify(h.failures));
+    else console.log("[health/conversions] ok (version " + (h.api_version && h.api_version.resolved) + ")");
+    return res.status(h.ok ? 200 : 503).json(h);
+  } catch (e) {
+    console.error("[health/conversions] threw:", e && e.stack || e);
+    return res.status(503).json({ ok: false, failures: ["health_check_threw: " + (e && e.message)] });
+  }
+});
+
 app.get("/customer-match/status/:code", function(req, res) {
   if (req.params.code !== process.env.LEAD_INBOUND_CODE) return res.status(401).json({ok:false});
   const c = _coworkPCMLoad();
