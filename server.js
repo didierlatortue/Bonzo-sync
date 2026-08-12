@@ -2500,6 +2500,99 @@ async function _coworkGetAdsToken() {
   return _coworkAdsToken;
 }
 
+// === COWORK 2026-08-12: Google Ads API version resolver ======================
+// Google retires an Ads API version every ~4-6 weeks and then BLOCKS it
+// (v20 died 2026-07-27; v21 died 2026-08-12). The block rolls out PARTIALLY
+// first — measured 2-in-3 requests failing while 1-in-3 still passed — so a
+// single green health check proves nothing, and the real-world symptom is
+// silent: offline conversions simply stop landing in Google Ads.
+//
+// This resolver is deliberately NOT "always use the newest version". A newer
+// version can rename or drop fields, which would swap a loud outage for a quiet
+// one. Policy: stay on the known-good version; climb ONLY when that version
+// actually stops answering, and shout in the logs when it does.
+//
+// Override with GOOGLE_ADS_API_VERSION (hard pin). Cap the climb with
+// GOOGLE_ADS_API_VERSION_MAX. Never throws — always returns a usable string.
+const ADS_VER_KNOWN_GOOD = process.env.GOOGLE_ADS_API_VERSION || "v22";
+const ADS_VER_CEILING    = parseInt(process.env.GOOGLE_ADS_API_VERSION_MAX || "40", 10);
+const ADS_VER_TTL_MS     = 12 * 60 * 60 * 1000;
+let _adsVerCache = { version: null, at: 0 };
+
+// true = alive · false = definitively retired/nonexistent · null = inconclusive
+async function _adsProbeVersion(v, access) {
+  try {
+    const cid = String(process.env.GOOGLE_ADS_CUSTOMER_ID || "").replace(/-/g, "");
+    const mcc = String(process.env.GOOGLE_ADS_MCC_ID || "").replace(/-/g, "");
+    const r = await fetch("https://googleads.googleapis.com/" + v + "/customers/" + cid + "/googleAds:search", {
+      method: "POST",
+      headers: {
+        "Authorization": "Bearer " + access,
+        "developer-token": process.env.GOOGLE_ADS_DEVELOPER_TOKEN,
+        "login-customer-id": mcc,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ query: "SELECT customer.id FROM customer" })
+    });
+    if (r.ok) return true;
+    const body = await r.text();
+    if (r.status === 404 || body.indexOf("UNSUPPORTED_VERSION") > -1) return false;
+    // Auth / quota / network failures are NOT a verdict on the version.
+    console.warn("[ads-version] " + v + " probe inconclusive (HTTP " + r.status + ") — not treating as dead");
+    return null;
+  } catch (e) {
+    console.warn("[ads-version] " + v + " probe threw: " + (e && e.message));
+    return null;
+  }
+}
+
+// Google blocks a version PARTIALLY before it blocks it totally — on 2026-08-12
+// v21 failed 2 of 3 identical probes. So one probe is never a verdict: require
+// two consecutive agreeing results before moving off, or onto, a version.
+async function _adsProbeStable(v, access) {
+  const a = await _adsProbeVersion(v, access);
+  if (a === null) return null;
+  const b = await _adsProbeVersion(v, access);
+  if (b === null) return null;
+  return (a === b) ? a : null;   // disagreement = mid-rollout = do not trust
+}
+
+async function _adsApiVersion() {
+  const now = Date.now();
+  if (_adsVerCache.version && (now - _adsVerCache.at) < ADS_VER_TTL_MS) return _adsVerCache.version;
+  let chosen = ADS_VER_KNOWN_GOOD;
+  try {
+    const access = await _coworkGetAdsToken();
+    const good = await _adsProbeStable(ADS_VER_KNOWN_GOOD, access);
+    if (good === true) {
+      console.log("[ads-version] using " + chosen + " (known-good, verified alive)");
+    } else if (good === false) {
+      let n = parseInt(String(ADS_VER_KNOWN_GOOD).replace(/\D/g, ""), 10);
+      let found = null;
+      while (++n <= ADS_VER_CEILING) {
+        const ok = await _adsProbeStable("v" + n, access);
+        if (ok === true) { found = "v" + n; break; }
+        if (ok === null) break; // inconclusive / mid-rollout — stop rather than guess
+      }
+      if (found) {
+        chosen = found;
+        console.error("[ads-version] 🔴 " + ADS_VER_KNOWN_GOOD + " is RETIRED — auto-advanced to " + found +
+          ". Uploads are still flowing. Set GOOGLE_ADS_API_VERSION=" + found +
+          " on Render and update ADS_VER_KNOWN_GOOD in server.js to make it permanent.");
+      } else {
+        console.error("[ads-version] 🔴 " + ADS_VER_KNOWN_GOOD + " is RETIRED and no working successor was found up to v" +
+          ADS_VER_CEILING + " — offline conversion uploads WILL FAIL until this is fixed by hand.");
+      }
+    } else {
+      console.warn("[ads-version] probe inconclusive — proceeding on " + chosen + " unverified");
+    }
+  } catch (e) {
+    console.error("[ads-version] resolver error, falling back to " + chosen + ": " + (e && e.message));
+  }
+  _adsVerCache = { version: chosen, at: now };
+  return chosen;
+}
+
 async function _googleCustomerMatchUpload(cache) {
   if (!cache || !cache.records || cache.records.length === 0) return null;
   const dt = process.env.GOOGLE_ADS_DEVELOPER_TOKEN;
@@ -2512,7 +2605,7 @@ async function _googleCustomerMatchUpload(cache) {
   if (!token) return { error: 'no token' };
   const cleanCid = String(cid).replace(/-/g, '');
   const cleanMcc = String(mcc).replace(/-/g, '');
-  const apiBase = 'https://googleads.googleapis.com/v22/customers/' + cleanCid;
+  const apiBase = 'https://googleads.googleapis.com/' + (await _adsApiVersion()) + '/customers/' + cleanCid;
   const headers = {
     'Authorization': 'Bearer ' + token,
     'developer-token': dt,
@@ -2548,7 +2641,7 @@ async function _googleCustomerMatchUpload(cache) {
   let lastError = null;
   for (let i = 0; i < operations.length; i += BATCH) {
     const batch = operations.slice(i, i + BATCH);
-    const addResp = await fetch('https://googleads.googleapis.com/v22/' + resourceName + ':addOperations', {
+    const addResp = await fetch('https://googleads.googleapis.com/' + (await _adsApiVersion()) + '/' + resourceName + ':addOperations', {
       method: 'POST', headers, body: JSON.stringify({ operations: batch, enablePartialFailure: true })
     });
     if (addResp.ok) {
@@ -2559,7 +2652,7 @@ async function _googleCustomerMatchUpload(cache) {
     }
   }
   if (lastError) return { resource: resourceName, operations_added: totalAdded, error: lastError };
-  const runResp = await fetch('https://googleads.googleapis.com/v22/' + resourceName + ':run', {
+  const runResp = await fetch('https://googleads.googleapis.com/' + (await _adsApiVersion()) + '/' + resourceName + ':run', {
     method: 'POST', headers, body: '{}'
   });
   return { resource: resourceName, operations_added: totalAdded, list_id: listId, run_status: runResp.status };
@@ -2603,7 +2696,7 @@ async function _coworkHandleAdsUpload(req, res) {
     const convResource = "customers/" + _cleanCid +
       "/conversionActions/" + _convId;
     const access = await _coworkGetAdsToken();
-    const url = "https://googleads.googleapis.com/v22/customers/" +
+    const url = "https://googleads.googleapis.com/" + (await _adsApiVersion()) + "/customers/" +
       _cleanCid + ":uploadClickConversions";
     const _conv = {
       conversionAction: convResource,
@@ -3455,4 +3548,5 @@ app.post("/spam-cleanup/:code", express.json({ limit: "1mb" }), async function(r
 
 app.listen(process.env.PORT || 3000, () => {
   console.log("Server running");
+_adsApiVersion().catch(function(e){ console.error("[ads-version] boot warm failed:", e && e.message); });
 });
