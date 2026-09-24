@@ -1020,7 +1020,12 @@ app.post("/bonzo/events", async (req, res) => {
       // === COWORK 2026-09-24: Plaid link when prospect enters Realtor.com "Application Completed" ===
       try {
         const _ps = (prospect && prospect.pipeline_stage) || {};
-        const _stageId = Number(_ps.id || (prospect && prospect.pipeline_stage_id) || 0);
+        let _stageId = Number(_ps.id || (prospect && prospect.pipeline_stage_id) || (prospect && prospect.pipeline && prospect.pipeline.stage_id) || 0);
+        console.log("[bonzo-event] " + event + " prospect=" + (prospect && prospect.id) + " stage=" + _stageId + " keys=" + Object.keys(prospect || {}).filter(k => /pipe|stage/i.test(k)).join(","));
+        if (!_stageId && prospect && prospect.id) {
+          const _g = await bonzoGetProspectById(prospect.id);
+          if (_g.ok && _g.json) _stageId = Number((_g.json.pipeline_stage && _g.json.pipeline_stage.id) || _g.json.pipeline_stage_id || 0);
+        }
         if (prospect && prospect.id && _stageId === PLAID_TRIGGER_STAGE_ID) {
           console.log("[plaid] prospect " + prospect.id + " in trigger stage " + _stageId + " (" + event + ")");
           setImmediate(() => { plaidEnsureLinkForProspect(prospect).then(r => console.log("[plaid] ensureLink " + prospect.id + " -> " + r.reason)).catch(e => console.error("[plaid] ensureLink error:", e && e.message)); });
