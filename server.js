@@ -3,6 +3,7 @@ import fs from "fs";
 import fetch from "node-fetch";
 
 import { createHash as _coworkCreateHash } from "crypto";
+import { createCipheriv as _plaidCipheriv, createDecipheriv as _plaidDecipheriv, randomBytes as _plaidRandomBytes } from "crypto";
 const app = express();
 // Cowork: CORS for /meta/capi from turturhomeloans.com (server-side Meta event from /thanks)
 app.use(function (req, res, next) {
@@ -1014,6 +1015,18 @@ app.post("/bonzo/events", async (req, res) => {
         }
       } catch (e) {
         console.error("[VALID-LEAD] non-fatal:", e && e.message);
+      }
+
+      // === COWORK 2026-09-24: Plaid link when prospect enters Realtor.com "Application Completed" ===
+      try {
+        const _ps = (prospect && prospect.pipeline_stage) || {};
+        const _stageId = Number(_ps.id || (prospect && prospect.pipeline_stage_id) || 0);
+        if (prospect && prospect.id && _stageId === PLAID_TRIGGER_STAGE_ID) {
+          console.log("[plaid] prospect " + prospect.id + " in trigger stage " + _stageId + " (" + event + ")");
+          setImmediate(() => { plaidEnsureLinkForProspect(prospect).then(r => console.log("[plaid] ensureLink " + prospect.id + " -> " + r.reason)).catch(e => console.error("[plaid] ensureLink error:", e && e.message)); });
+        }
+      } catch (e) {
+        console.error("[plaid] stage hook non-fatal:", e && e.message);
       }
     }
     res.status(200).json({ ok: true });
@@ -3777,6 +3790,338 @@ app.post("/spam-cleanup/:code", express.json({ limit: "1mb" }), async function(r
   }
 });
 
+
+
+// =========================
+// === COWORK 2026-09-24: PLAID STATEMENTS ===
+// Flow (owner-approved 2026-09-24):
+//  1. Bonzo prospect enters Realtor.com Leads -> "Application Completed" (stage PLAID_TRIGGER_STAGE_ID)
+//     -> /bonzo/events -> plaidEnsureLinkForProspect(): Hosted Link, 7 days, 12 months of statements,
+//     saved as a PINNED Bonzo note for Didier to copy/send. Reuses an unexpired link (no duplicate).
+//  2. Borrower finishes Plaid -> Plaid POSTs LINK/SESSION_FINISHED to /plaid/webhook/:code
+//     -> exchange public_token within 30 min -> store encrypted access_token in plaid_items
+//     -> pinned note "<Name> bank statements are ready" + bank/accounts/months + download link
+//     -> Bonzo task assigned to Didier.
+//  3. GET /plaid/statements/:itemId?key=... -> ZIP of the bank's own PDF statements (pulled live).
+// Env: PLAID_CLIENT_ID, PLAID_SECRET, PLAID_ENV (production|sandbox), PLAID_CODE, PLAID_TOKEN_KEY (64 hex),
+//      PUBLIC_BASE_URL, PLAID_TRIGGER_STAGE_ID (default 495293), PLAID_TASK_ASSIGNEE_ID (default 94679)
+// =========================
+
+const PLAID_TRIGGER_STAGE_ID = Number(process.env.PLAID_TRIGGER_STAGE_ID || 495293);
+const PLAID_TASK_ASSIGNEE_ID = Number(process.env.PLAID_TASK_ASSIGNEE_ID || 94679);
+const PLAID_LINK_DAYS = 7;
+const PLAID_STATEMENT_MONTHS = 12;
+const _plaidInFlight = new Set();
+
+function plaidConfigured() {
+  return !!(process.env.PLAID_CLIENT_ID && process.env.PLAID_SECRET && process.env.PLAID_CODE && /^[0-9a-f]{64}$/i.test(process.env.PLAID_TOKEN_KEY || ""));
+}
+function plaidBase() {
+  return (process.env.PLAID_ENV || "production") === "sandbox" ? "https://sandbox.plaid.com" : "https://production.plaid.com";
+}
+function plaidPublicBase() {
+  return String(process.env.PUBLIC_BASE_URL || "https://bonzo-sync.onrender.com").replace(/\/+$/, "");
+}
+async function plaidPost(path, body, opts) {
+  opts = opts || {};
+  const r = await fetch(plaidBase() + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(Object.assign({ client_id: process.env.PLAID_CLIENT_ID, secret: process.env.PLAID_SECRET }, body || {})),
+  });
+  if (opts.binary) {
+    const buf = Buffer.from(await r.arrayBuffer());
+    if (!r.ok) return { ok: false, status: r.status, text: buf.toString("utf8").slice(0, 500) };
+    return { ok: true, status: r.status, buf };
+  }
+  const out = await readJsonOrText(r);
+  if (!out.ok) console.warn("[plaid] " + path + " -> " + out.status + " " + JSON.stringify(out.json || out.text).slice(0, 400));
+  return out;
+}
+function _plaidEncrypt(plain) {
+  const key = Buffer.from(process.env.PLAID_TOKEN_KEY, "hex");
+  const iv = _plaidRandomBytes(12);
+  const c = _plaidCipheriv("aes-256-gcm", key, iv);
+  const enc = Buffer.concat([c.update(String(plain), "utf8"), c.final()]);
+  return [iv.toString("hex"), c.getAuthTag().toString("hex"), enc.toString("hex")].join(":");
+}
+function _plaidDecrypt(blob) {
+  const [ivh, tagh, ench] = String(blob).split(":");
+  const key = Buffer.from(process.env.PLAID_TOKEN_KEY, "hex");
+  const d = _plaidDecipheriv("aes-256-gcm", key, Buffer.from(ivh, "hex"));
+  d.setAuthTag(Buffer.from(tagh, "hex"));
+  return Buffer.concat([d.update(Buffer.from(ench, "hex")), d.final()]).toString("utf8");
+}
+function _plaidEsc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+function _plaidEtDate(d) {
+  // YYYY-MM-DD in America/New_York
+  return new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
+}
+function _plaidEtLong(d) {
+  return new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", month: "short", day: "numeric", year: "numeric", hour: "2-digit", minute: "2-digit", hour12: false }).format(d) + " ET";
+}
+const _PLAID_MON = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+
+let _plaidTablesReady = false;
+async function _plaidPool() {
+  const pool = await _pgGetPool();
+  if (!pool) throw new Error("DATABASE_URL not set");
+  if (!_plaidTablesReady) {
+    await pool.query(`CREATE TABLE IF NOT EXISTS plaid_links (
+      link_token TEXT PRIMARY KEY,
+      prospect_id TEXT NOT NULL,
+      hosted_link_url TEXT NOT NULL,
+      expires_at TIMESTAMPTZ NOT NULL,
+      status TEXT NOT NULL DEFAULT 'created',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+    await pool.query("CREATE INDEX IF NOT EXISTS plaid_links_prospect_idx ON plaid_links(prospect_id)");
+    await pool.query(`CREATE TABLE IF NOT EXISTS plaid_items (
+      item_id TEXT PRIMARY KEY,
+      prospect_id TEXT NOT NULL,
+      link_token TEXT,
+      access_token_enc TEXT NOT NULL,
+      download_key TEXT NOT NULL,
+      institution_name TEXT,
+      summary JSONB,
+      revoked_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+    await pool.query("CREATE INDEX IF NOT EXISTS plaid_items_prospect_idx ON plaid_items(prospect_id)");
+    _plaidTablesReady = true;
+  }
+  return pool;
+}
+
+async function _plaidBonzoNote(prospectId, html, pinned) {
+  const out = await bonzoFetch("/prospects/" + encodeURIComponent(prospectId) + "/notes", {
+    method: "POST",
+    body: JSON.stringify({ content: html, is_pinned: !!pinned, include_in_conversation: false }),
+  });
+  if (!out.ok) console.warn("[plaid] Bonzo note failed for " + prospectId + ": " + out.status);
+  return out;
+}
+async function _plaidBonzoTask(prospectId, title, details) {
+  const now = new Date();
+  const out = await bonzoFetch("/tasks", {
+    method: "POST",
+    body: JSON.stringify({
+      type: "none",
+      title: String(title).slice(0, 256),
+      details: String(details).slice(0, 2000),
+      assignee_id: PLAID_TASK_ASSIGNEE_ID,
+      prospect_id: Number(prospectId),
+      priority: 1,
+      date: _plaidEtDate(now),
+      time: new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hour12: true }).format(now).replace(/[\s\u202f\u00a0]+/g, " ").toLowerCase(),
+      frequency: "none",
+      length: "15",
+    }),
+  });
+  if (!out.ok) console.warn("[plaid] Bonzo task failed for " + prospectId + ": " + out.status + " " + JSON.stringify(out.json || out.text).slice(0, 300));
+  return out;
+}
+function _plaidName(p) {
+  const n = [p && p.first_name, p && p.last_name].filter(Boolean).join(" ").trim();
+  return n || (p && (p.full_name || p.name)) || ("Prospect " + (p && p.id));
+}
+
+// Step 1 — create (or reuse) the borrower's Plaid link and pin it to the Bonzo record
+async function plaidEnsureLinkForProspect(prospect, opts) {
+  opts = opts || {};
+  const pid = String(prospect && prospect.id || "");
+  if (!pid) return { ok: false, reason: "no_prospect_id" };
+  if (!plaidConfigured()) { console.warn("[plaid] not configured — skipping link for " + pid); return { ok: false, reason: "plaid_not_configured" }; }
+  if (_plaidInFlight.has(pid)) return { ok: true, reason: "in_flight" };
+  _plaidInFlight.add(pid);
+  try {
+    const pool = await _plaidPool();
+    const conn = await pool.query("SELECT item_id FROM plaid_items WHERE prospect_id=$1 AND revoked_at IS NULL LIMIT 1", [pid]);
+    if (conn.rows.length && !opts.force) return { ok: true, reason: "already_connected", item_id: conn.rows[0].item_id };
+    const live = await pool.query("SELECT link_token, hosted_link_url, expires_at FROM plaid_links WHERE prospect_id=$1 AND expires_at > now() + interval '1 hour' ORDER BY created_at DESC LIMIT 1", [pid]);
+    if (live.rows.length && !opts.force) return { ok: true, reason: "reused_existing", url: live.rows[0].hosted_link_url, expires_at: live.rows[0].expires_at };
+
+    const now = new Date();
+    const end = _plaidEtDate(now);
+    const startD = new Date(now.getTime()); startD.setFullYear(startD.getFullYear() - 1); startD.setDate(startD.getDate() + 1);
+    const start = _plaidEtDate(startD);
+    const out = await plaidPost("/link/token/create", {
+      client_name: "Turtur Home Loans",
+      language: "en",
+      country_codes: ["US"],
+      user: { client_user_id: "bonzo-" + pid },
+      products: ["statements"],
+      statements: { start_date: start, end_date: end },
+      webhook: plaidPublicBase() + "/plaid/webhook/" + process.env.PLAID_CODE,
+      hosted_link: { url_lifetime_seconds: PLAID_LINK_DAYS * 86400 },
+    });
+    if (!out.ok || !out.json || !out.json.hosted_link_url) return { ok: false, reason: "link_create_failed", status: out.status, error: out.json || out.text };
+    const expires = out.json.expiration ? new Date(out.json.expiration) : new Date(now.getTime() + PLAID_LINK_DAYS * 86400000);
+    await pool.query("INSERT INTO plaid_links(link_token, prospect_id, hosted_link_url, expires_at) VALUES($1,$2,$3,$4) ON CONFLICT (link_token) DO NOTHING",
+      [out.json.link_token, pid, out.json.hosted_link_url, expires]);
+    const name = _plaidName(prospect);
+    const html = "<p><strong>Plaid bank statement link for " + _plaidEsc(name) + "</strong></p>" +
+      "<p>" + _plaidEsc(out.json.hosted_link_url) + "</p>" +
+      "<p>12 months of statements (" + start + " to " + end + "). Link expires " + _plaidEsc(_plaidEtLong(expires)) + ". Copy and send to the borrower.</p>";
+    await _plaidBonzoNote(pid, html, true);
+    console.log("[plaid] link created for prospect " + pid + " expires " + expires.toISOString());
+    return { ok: true, reason: "created", url: out.json.hosted_link_url, expires_at: expires };
+  } catch (e) {
+    console.error("[plaid] ensureLink error for " + pid + ":", e && e.stack || e);
+    return { ok: false, reason: "exception", error: String(e && e.message || e) };
+  } finally {
+    _plaidInFlight.delete(pid);
+  }
+}
+
+// Step 2 — Plaid finished: exchange, store, notify
+async function _plaidHandleSessionFinished(body) {
+  const pool = await _plaidPool();
+  const lt = String(body.link_token || "");
+  const link = await pool.query("SELECT prospect_id FROM plaid_links WHERE link_token=$1", [lt]);
+  if (!link.rows.length) { console.warn("[plaid] SESSION_FINISHED for unknown link_token"); return; }
+  const pid = link.rows[0].prospect_id;
+  if (String(body.status || "").toUpperCase() !== "SUCCESS") {
+    await pool.query("UPDATE plaid_links SET status=$2 WHERE link_token=$1", [lt, "exited"]);
+    console.log("[plaid] session EXITED for prospect " + pid);
+    return;
+  }
+  const tokens = Array.isArray(body.public_tokens) && body.public_tokens.length ? body.public_tokens : (body.public_token ? [body.public_token] : []);
+  await pool.query("UPDATE plaid_links SET status='connected' WHERE link_token=$1", [lt]);
+  let prospect = { id: pid };
+  try { const g = await bonzoGetProspectById(pid); if (g.ok && g.json) prospect = g.json; } catch (_) {}
+  const name = _plaidName(prospect);
+  for (const pt of tokens) {
+    const ex = await plaidPost("/item/public_token/exchange", { public_token: pt });
+    if (!ex.ok || !ex.json || !ex.json.access_token) { console.error("[plaid] exchange failed for prospect " + pid); continue; }
+    const itemId = ex.json.item_id, at = ex.json.access_token;
+    const key = _plaidRandomBytes(24).toString("hex");
+    const ins = await pool.query(
+      "INSERT INTO plaid_items(item_id, prospect_id, link_token, access_token_enc, download_key) VALUES($1,$2,$3,$4,$5) ON CONFLICT (item_id) DO NOTHING RETURNING item_id",
+      [itemId, pid, lt, _plaidEncrypt(at), key]);
+    if (!ins.rows.length) { console.log("[plaid] item " + itemId + " already stored — skip duplicate notify"); continue; }
+    let list = null;
+    for (let i = 0; i < 4; i++) {
+      const l = await plaidPost("/statements/list", { access_token: at });
+      if (l.ok && l.json && Array.isArray(l.json.accounts)) { list = l.json; break; }
+      await sleep(15000);
+    }
+    const bank = (list && list.institution_name) || "Bank";
+    const lines = [];
+    let count = 0;
+    for (const a of (list && list.accounts) || []) {
+      const st = (a.statements || []).slice().sort((x, y) => (x.year - y.year) || (x.month - y.month));
+      count += st.length;
+      const range = st.length ? (_PLAID_MON[st[0].month - 1] + " " + st[0].year + " – " + _PLAID_MON[st[st.length - 1].month - 1] + " " + st[st.length - 1].year) : "no statements returned";
+      lines.push((a.account_name || a.account_official_name || a.account_subtype || "Account") + " ••" + (a.account_mask || "????") + ": " + range + " (" + st.length + " statements)");
+    }
+    await pool.query("UPDATE plaid_items SET institution_name=$2, summary=$3 WHERE item_id=$1", [itemId, bank, JSON.stringify({ lines, count })]);
+    const dl = plaidPublicBase() + "/plaid/statements/" + encodeURIComponent(itemId) + "?key=" + key;
+    const html = "<p><strong>" + _plaidEsc(name) + " bank statements are ready</strong></p>" +
+      "<p>Bank: " + _plaidEsc(bank) + "</p>" +
+      "<p>" + (lines.length ? lines.map(_plaidEsc).join("<br>") : "Statements list not available yet — the download link pulls them live.") + "</p>" +
+      "<p>Download (ZIP of the bank's PDFs): " + _plaidEsc(dl) + "</p>" +
+      "<p>Connected " + _plaidEsc(_plaidEtLong(new Date())) + "</p>";
+    await _plaidBonzoNote(pid, html, true);
+    await _plaidBonzoTask(pid, name + " bank statements are ready",
+      "Bank: " + bank + "\n" + lines.join("\n") + "\nDownload: " + dl);
+    console.log("[plaid] item stored + notified for prospect " + pid + " (" + count + " statements)");
+  }
+}
+
+// Minimal ZIP writer (store, no compression) — PDFs are already compressed
+const _PLAID_CRC = (() => { const t = new Uint32Array(256); for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; t[n] = c >>> 0; } return t; })();
+function _plaidCrc32(buf) { let c = 0xFFFFFFFF; for (let i = 0; i < buf.length; i++) c = _PLAID_CRC[(c ^ buf[i]) & 0xFF] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; }
+function _plaidZip(files) {
+  const parts = [], central = []; let offset = 0;
+  for (const f of files) {
+    const name = Buffer.from(f.name, "utf8"), crc = _plaidCrc32(f.data), size = f.data.length;
+    const lh = Buffer.alloc(30); lh.writeUInt32LE(0x04034b50, 0); lh.writeUInt16LE(20, 4); lh.writeUInt16LE(0x0800, 6); lh.writeUInt16LE(0, 8);
+    lh.writeUInt16LE(0, 10); lh.writeUInt16LE(0x21, 12); lh.writeUInt32LE(crc, 14); lh.writeUInt32LE(size, 18); lh.writeUInt32LE(size, 22);
+    lh.writeUInt16LE(name.length, 26); lh.writeUInt16LE(0, 28);
+    parts.push(lh, name, f.data);
+    const ch = Buffer.alloc(46); ch.writeUInt32LE(0x02014b50, 0); ch.writeUInt16LE(20, 4); ch.writeUInt16LE(20, 6); ch.writeUInt16LE(0x0800, 8);
+    ch.writeUInt16LE(0, 10); ch.writeUInt16LE(0, 12); ch.writeUInt16LE(0x21, 14); ch.writeUInt32LE(crc, 16); ch.writeUInt32LE(size, 20);
+    ch.writeUInt32LE(size, 24); ch.writeUInt16LE(name.length, 28); ch.writeUInt16LE(0, 30); ch.writeUInt16LE(0, 32); ch.writeUInt16LE(0, 34);
+    ch.writeUInt16LE(0, 36); ch.writeUInt32LE(0, 38); ch.writeUInt32LE(offset, 42);
+    central.push(ch, name);
+    offset += 30 + name.length + size;
+  }
+  const cd = Buffer.concat(central);
+  const end = Buffer.alloc(22); end.writeUInt32LE(0x06054b50, 0); end.writeUInt16LE(0, 4); end.writeUInt16LE(0, 6);
+  end.writeUInt16LE(files.length, 8); end.writeUInt16LE(files.length, 10); end.writeUInt32LE(cd.length, 12); end.writeUInt32LE(offset, 16); end.writeUInt16LE(0, 20);
+  return Buffer.concat(parts.concat([cd, end]));
+}
+function _plaidSafe(s) { return String(s || "").replace(/[^A-Za-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "x"; }
+
+app.post("/plaid/webhook/:code", async (req, res) => {
+  if (!process.env.PLAID_CODE || req.params.code !== process.env.PLAID_CODE) return res.status(401).send("Unauthorized");
+  res.status(200).json({ ok: true });
+  const b = req.body || {};
+  console.log("[plaid] webhook " + b.webhook_type + "/" + b.webhook_code + " status=" + (b.status || ""));
+  setImmediate(async () => {
+    try {
+      if (b.webhook_type === "LINK" && b.webhook_code === "SESSION_FINISHED") await _plaidHandleSessionFinished(b);
+      else if (b.webhook_type === "ITEM" && ["USER_PERMISSION_REVOKED", "USER_ACCOUNT_REVOKED"].includes(b.webhook_code) && b.item_id) {
+        const pool = await _plaidPool();
+        const r = await pool.query("UPDATE plaid_items SET revoked_at=now() WHERE item_id=$1 RETURNING prospect_id", [b.item_id]);
+        if (r.rows.length) await _plaidBonzoNote(r.rows[0].prospect_id, "<p>Borrower revoked Plaid bank access — the statement download link no longer works.</p>", false);
+      }
+    } catch (e) { console.error("[plaid] webhook handler error:", e && e.stack || e); }
+  });
+});
+
+app.get("/plaid/statements/:itemId", async (req, res) => {
+  try {
+    if (!plaidConfigured()) return res.status(503).send("Plaid not configured");
+    const pool = await _plaidPool();
+    const r = await pool.query("SELECT * FROM plaid_items WHERE item_id=$1", [req.params.itemId]);
+    const row = r.rows[0];
+    if (!row || !req.query.key || String(req.query.key) !== row.download_key) return res.status(404).send("Not found");
+    if (row.revoked_at) return res.status(410).send("The borrower revoked access to this bank connection.");
+    const at = _plaidDecrypt(row.access_token_enc);
+    const l = await plaidPost("/statements/list", { access_token: at });
+    if (!l.ok || !l.json) return res.status(502).send("Plaid statements list failed (" + l.status + ")");
+    let last = "Borrower";
+    try { const g = await bonzoGetProspectById(row.prospect_id); if (g.ok && g.json) last = g.json.last_name || _plaidName(g.json); } catch (_) {}
+    const bank = _plaidSafe(l.json.institution_name || "Bank");
+    const files = [];
+    for (const a of l.json.accounts || []) {
+      for (const s of a.statements || []) {
+        const d = await plaidPost("/statements/download", { access_token: at, statement_id: s.statement_id }, { binary: true });
+        if (!d.ok) { console.warn("[plaid] download failed " + s.statement_id + " " + d.status); continue; }
+        files.push({ name: _plaidSafe(last) + "_" + bank + "_" + _plaidSafe(a.account_name || a.account_subtype || "Account") + "-" + (a.account_mask || "0000") + "_" + s.year + "-" + String(s.month).padStart(2, "0") + ".pdf", data: d.buf });
+      }
+    }
+    if (!files.length) return res.status(404).send("No statements returned by the bank.");
+    files.sort((x, y) => x.name < y.name ? 1 : -1);
+    const zip = _plaidZip(files);
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", 'attachment; filename="' + _plaidSafe(last) + "_" + bank + '_statements.zip"');
+    res.setHeader("Cache-Control", "no-store");
+    return res.status(200).send(zip);
+  } catch (e) {
+    console.error("[plaid] statements download error:", e && e.stack || e);
+    return res.status(500).send("Server error");
+  }
+});
+
+// Manual trigger / test: POST /plaid/link/:code {prospect_id, force?}
+app.post("/plaid/link/:code", express.json({ limit: "16kb" }), async (req, res) => {
+  if (!process.env.PLAID_CODE || req.params.code !== process.env.PLAID_CODE) return res.status(401).send("Unauthorized");
+  const pid = req.body && req.body.prospect_id;
+  if (!pid) return res.status(400).json({ ok: false, error: "prospect_id required" });
+  const g = await bonzoGetProspectById(pid);
+  const out = await plaidEnsureLinkForProspect(g.ok && g.json ? g.json : { id: pid }, { force: !!(req.body && req.body.force) });
+  return res.status(out.ok ? 200 : 500).json(Object.assign({}, out, { url: out.url ? "(in Bonzo note)" : undefined }));
+});
+app.get("/plaid/status/:code", async (req, res) => {
+  if (!process.env.PLAID_CODE || req.params.code !== process.env.PLAID_CODE) return res.status(401).send("Unauthorized");
+  return res.json({ ok: true, configured: plaidConfigured(), env: process.env.PLAID_ENV || "production", has_client_id: !!process.env.PLAID_CLIENT_ID, has_secret: !!process.env.PLAID_SECRET, trigger_stage: PLAID_TRIGGER_STAGE_ID });
+});
+// === END PLAID STATEMENTS ===
 
 app.listen(process.env.PORT || 3000, () => {
   console.log("Server running");
