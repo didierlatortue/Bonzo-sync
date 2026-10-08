@@ -155,7 +155,7 @@
       api("POST", "/login", { email: email.value, password: pw.value }).then(function (j) { setTok(j.token); viewAccount(); })
         .catch(function (e2) { err.appendChild(errBox(e2.message)); busy(btn, false, "Log in"); });
     } }, [h("label", { for: "lp-email", text: "Email" }), email, h("label", { for: "lp-pw", text: "Password" }), pw, btn, err]);
-    shell([msg ? h("div", { class: "lp-okmsg", text: msg }) : null, h("div", { class: "lp-card" }, [h("h1", { text: "Log in" }), form,
+    shell([msg ? h("div", { class: "lp-okmsg", text: msg }) : null, h("div", { class: "lp-card" }, [h("h1", { text: "Employee Log in" }), form,
       h("button", { class: "lp-link", type: "button", onclick: viewForgot, text: "Forgot your password?" })])]);
   }
 
