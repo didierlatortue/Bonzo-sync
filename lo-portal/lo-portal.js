@@ -651,6 +651,8 @@ export function mountLoPortal(app, deps) {
         },
       ];
       if (setupStillDue) params.line_items.push({ price: setup.id, quantity: 1 });
+      params.submit_type = "subscribe";
+      params.custom_text = { submit: { message: "Due today: " + (setupStillDue ? "the one-time setup fee plus " : "") + "your first full month (through " + monthEndLabel(anchor) + "). After that, $" + (sub.unit_amount / 100).toFixed(2) + " is billed on the 1st of each month." } };
       params.subscription_data = {
         metadata: { lo_user_id: String(u.id), first_month_through: monthEndLabel(anchor) },
         trial_end: anchor,
