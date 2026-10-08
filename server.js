@@ -1,10 +1,22 @@
 import express from "express";
 import fs from "fs";
 import fetch from "node-fetch";
+import { mountLoPortal } from "./lo-portal/lo-portal.js";
 
 import { createHash as _coworkCreateHash } from "crypto";
 import { createCipheriv as _plaidCipheriv, createDecipheriv as _plaidDecipheriv, randomBytes as _plaidRandomBytes } from "crypto";
 const app = express();
+// === COWORK 2026-10-07: LO portal (Stripe subscriptions for loan officers) ===
+// Mounted BEFORE the global express.json() so /lo-portal/stripe/webhook gets the raw body for signature checks.
+function _loReadAsset(name) {
+  try { return fs.readFileSync(new URL("./lo-portal/" + name, import.meta.url), "utf8"); } catch (e) { console.log("[LO] asset missing", name, e.message); return null; }
+}
+mountLoPortal(app, {
+  getPool: () => _pgGetPool(),
+  getMsGraphToken: () => getMsGraphToken(),
+  appJs: _loReadAsset("app.js"),
+  adminHtml: _loReadAsset("admin.html"),
+});
 // Cowork: CORS for /meta/capi from turturhomeloans.com (server-side Meta event from /thanks)
 app.use(function (req, res, next) {
   if (req.path === "/meta/capi" || req.path.indexOf("/lead/inbound") === 0) {

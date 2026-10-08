@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>LO Portal Admin</title>
+<style>
+:root{--navy:#0f2a44;--ink:#1d2733;--muted:#5b6876;--line:#dde3ea;--bg:#f5f7fa;--ok:#1f7a4d;--warn:#a15c00;--bad:#b42318}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:var(--ink);background:var(--bg);font-size:15px;line-height:1.45}
+header{background:var(--navy);color:#fff;padding:14px 16px}
+header .in{max-width:1100px;margin:0 auto;display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
+.mode{border-radius:999px;padding:3px 12px;font-weight:700;font-size:13px}
+.mode.test{background:#fff4e0;color:var(--warn)}.mode.live{background:#e8f5ee;color:var(--ok)}
+main{max-width:1100px;margin:20px auto;padding:0 16px}
+.card{background:#fff;border:1px solid var(--line);border-radius:10px;padding:18px;margin:0 0 16px}
+h2{margin:0 0 12px;font-size:18px;color:var(--navy)}
+label{display:block;font-weight:600;font-size:13px;margin:10px 0 4px}
+select,input{width:100%;padding:9px 10px;border:1px solid #c5ced8;border-radius:8px;font-size:15px;background:#fff}
+.row{display:flex;gap:12px;flex-wrap:wrap}.row>div{flex:1 1 220px}
+button{background:var(--navy);color:#fff;border:0;border-radius:8px;padding:9px 14px;font-weight:600;cursor:pointer;font-size:14px;margin:10px 6px 0 0}
+button.sec{background:#fff;color:var(--navy);border:1px solid var(--navy)}
+button.small{padding:4px 9px;font-size:12px;margin:2px 4px 2px 0}
+button.bad{background:#fff;color:var(--bad);border:1px solid var(--bad)}
+table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;padding:7px 6px;border-bottom:1px solid var(--line);vertical-align:top}th{color:var(--muted)}
+.scroll{overflow-x:auto}
+.msg{border-radius:8px;padding:10px 12px;margin:10px 0 0;font-size:14px;word-break:break-all}
+.ok{background:#e8f5ee;color:var(--ok)}.err{background:#fdecea;color:var(--bad)}
+.pill{border-radius:999px;padding:1px 8px;font-size:12px;font-weight:600;white-space:nowrap}
+.p-ok{background:#e8f5ee;color:var(--ok)}.p-warn{background:#fff4e0;color:var(--warn)}.p-bad{background:#fdecea;color:var(--bad)}.p-mute{background:#eef1f4;color:var(--muted)}
+.muted{color:var(--muted);font-size:13px}
+.linkbox{display:flex;gap:8px;align-items:center;margin-top:10px}.linkbox input{font-family:monospace;font-size:13px}
+</style>
+</head>
+<body>
+<header><div class="in"><div><strong>Turtur Home Loans</strong> · LO Portal Admin</div><div id="mode" class="mode">…</div></div></header>
+<main>
+  <div class="card" id="setup"><h2>Setup status</h2><div id="setupBody" class="muted">Loading… (first load can take up to a minute while the server wakes up)</div></div>
+
+  <div class="card">
+    <h2>Create a registration link</h2>
+    <p class="muted">Pick what this LO will see and pay. Each link works once. If you enter their email, the link only registers that email.</p>
+    <div class="row">
+      <div><label for="setupSel">Setup fee</label><select id="setupSel"></select></div>
+      <div><label for="subSel">Monthly subscription</label><select id="subSel"></select></div>
+    </div>
+    <div class="row">
+      <div><label for="email">LO email (optional)</label><input id="email" type="email" placeholder="name@example.com"></div>
+      <div><label for="note">Note (optional, only you see it)</label><input id="note" type="text" placeholder="e.g. Jane Smith — WA"></div>
+      <div style="flex:0 1 140px"><label for="days">Expires in (days)</label><input id="days" type="number" min="1" max="60" value="14"></div>
+    </div>
+    <button id="createBtn">Create link</button>
+    <div id="createOut"></div>
+  </div>
+
+  <div class="card"><h2>Loan officers</h2><div class="scroll"><table><thead><tr><th>Name</th><th>Contact</th><th>Plan</th><th>Status</th><th>Setup paid</th><th>Renews / ends</th><th></th></tr></thead><tbody id="users"></tbody></table></div><div id="userOut"></div></div>
+
+  <div class="card"><h2>Registration links</h2><div class="scroll"><table><thead><tr><th>Created</th><th>For</th><th>Plan</th><th>Status</th><th></th></tr></thead><tbody id="invites"></tbody></table></div><div id="invOut"></div></div>
+</main>
+<script>
+(function(){
+  var CODE = location.pathname.split("/").filter(Boolean).pop();
+  var BASE = location.origin + "/lo-portal/admin/" + encodeURIComponent(CODE);
+  var DATA = null, PRICES = {};
+  function $(id){return document.getElementById(id)}
+  function esc(s){return String(s==null?"":s).replace(/[&<>"']/g,function(c){return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]})}
+  function money(c,cur){return (Number(c||0)/100).toLocaleString("en-US",{style:"currency",currency:(cur||"usd").toUpperCase()})}
+  function d(v){if(!v)return "—";return new Date(v).toLocaleDateString("en-US",{year:"numeric",month:"short",day:"numeric"})}
+  function priceLabel(id){var p=PRICES[id];if(!id)return "";if(!p)return id;return p.name+" "+money(p.amount,p.currency)+(p.interval?"/"+p.interval:"")}
+  function call(method,path,body){return fetch(BASE+path,{method:method,headers:{"Content-Type":"application/json"},body:body?JSON.stringify(body):undefined,cache:"no-store"}).then(function(r){return r.json().then(function(j){if(!r.ok||j.ok===false)throw new Error(j.error||("HTTP "+r.status));return j})})}
+  function msg(el,cls,text){el.innerHTML='<div class="msg '+cls+'">'+esc(text)+'</div>'}
+  function copy(text,btn){(navigator.clipboard?navigator.clipboard.writeText(text):Promise.reject()).then(function(){btn.textContent="Copied";setTimeout(function(){btn.textContent="Copy"},1500)}).catch(function(){prompt("Copy this link:",text)})}
+  window.__copy=copy;
+
+  function load(){
+    return call("GET","/data").then(function(j){
+      DATA=j; PRICES={}; j.prices.forEach(function(p){PRICES[p.price_id]=p});
+      var m=$("mode"); m.textContent=j.mode==="live"?"LIVE":"TEST MODE"; m.className="mode "+j.mode;
+      var s=[];
+      s.push((j.webhook_connected?'<span class="pill p-ok">Stripe webhook connected</span>':'<span class="pill p-bad">Stripe webhook not connected</span>')+' <button class="small sec" id="whBtn">'+(j.webhook_connected?"Reconnect":"Connect")+' webhook</button>');
+      s.push(j.publishable_key_set?'<span class="pill p-ok">Publishable key set</span>':'<span class="pill p-bad">Publishable key missing</span>');
+      s.push('<button class="small sec" id="mailBtn">Send test email</button>');
+      s.push('<div class="muted" style="margin-top:8px">Portal page: <a href="'+esc(j.portal_url)+'" target="_blank" rel="noopener">'+esc(j.portal_url)+'</a></div>');
+      $("setupBody").innerHTML=s.join(" ")+'<div id="setupOut"></div>';
+      $("whBtn").onclick=function(){this.disabled=true;call("POST","/connect-webhook").then(function(r){msg($("setupOut"),"ok","Webhook connected ("+r.mode+"): "+r.url);load()}).catch(function(e){msg($("setupOut"),"err",e.message)})};
+      $("mailBtn").onclick=function(){this.disabled=true;call("POST","/test-email").then(function(r){msg($("setupOut"),"ok","Test email sent to "+r.to)}).catch(function(e){msg($("setupOut"),"err","Email failed: "+e.message)})};
+
+      var one=j.prices.filter(function(p){return p.kind==="setup"}), rec=j.prices.filter(function(p){return p.kind==="subscription"});
+      var keepS=$("setupSel").value, keepR=$("subSel").value;
+      $("setupSel").innerHTML='<option value="">None</option>'+one.map(function(p){return '<option value="'+esc(p.price_id)+'">'+esc(p.name+" — "+money(p.amount,p.currency))+'</option>'}).join("");
+      $("subSel").innerHTML='<option value="">None</option>'+rec.map(function(p){return '<option value="'+esc(p.price_id)+'">'+esc(p.name+" — "+money(p.amount,p.currency)+" / "+p.interval)+'</option>'}).join("");
+      if(keepS)$("setupSel").value=keepS; if(keepR)$("subSel").value=keepR;
+      if(!keepR&&rec.length===1)$("subSel").value=rec[0].price_id;
+
+      $("users").innerHTML=j.users.length?j.users.map(function(u){
+        var st=u.disabled?'<span class="pill p-bad">Disabled</span>':(u.subscription_status==="active"||u.subscription_status==="trialing")?(u.cancel_at?'<span class="pill p-warn">Cancelling</span>':'<span class="pill p-ok">Active</span>'):u.subscription_status?'<span class="pill p-warn">'+esc(u.subscription_status)+'</span>':(u.sub_price_id?'<span class="pill p-mute">Not paid</span>':(u.setup_paid_at?'<span class="pill p-ok">Paid</span>':'<span class="pill p-mute">Not paid</span>'));
+        var ren=u.cancel_at?"Ends "+d(u.cancel_at):(u.current_period_end?"Renews "+d(u.current_period_end):"—");
+        return '<tr><td>'+esc(u.first_name+" "+u.last_name)+'<div class="muted">since '+d(u.created_at)+'</div></td><td>'+esc(u.email)+'<div class="muted">'+esc(u.phone)+'</div></td><td>'+esc(priceLabel(u.setup_price_id))+'<div>'+esc(priceLabel(u.sub_price_id))+'</div></td><td>'+st+'</td><td>'+d(u.setup_paid_at)+'</td><td>'+ren+'</td><td>'+
+          '<button class="small sec" data-act="reset" data-id="'+u.id+'">Reset link</button><button class="small sec" data-act="sync" data-id="'+u.id+'">Refresh</button>'+
+          (u.disabled?'<button class="small sec" data-act="enable" data-id="'+u.id+'">Enable</button>':'<button class="small bad" data-act="disable" data-id="'+u.id+'">Disable login</button>')+'</td></tr>';
+      }).join(""):'<tr><td colspan="7" class="muted">No loan officers yet.</td></tr>';
+
+      $("invites").innerHTML=j.invites.length?j.invites.map(function(i){
+        var now=Date.now(), stt=i.revoked_at?'<span class="pill p-mute">Cancelled</span>':i.used_at?'<span class="pill p-ok">Used</span>':(new Date(i.expires_at).getTime()<now?'<span class="pill p-mute">Expired</span>':'<span class="pill p-warn">Open — expires '+d(i.expires_at)+'</span>');
+        var open=!i.revoked_at&&!i.used_at&&new Date(i.expires_at).getTime()>=now;
+        return '<tr><td>'+d(i.created_at)+'</td><td>'+esc(i.email||"Anyone with the link")+'<div class="muted">'+esc(i.note||"")+'</div></td><td>'+esc(priceLabel(i.setup_price_id))+'<div>'+esc(priceLabel(i.sub_price_id))+'</div></td><td>'+stt+'</td><td>'+
+          (open?'<button class="small sec" data-copy="'+esc(i.link)+'">Copy</button><button class="small bad" data-revoke="'+esc(i.token_hint)+'">Cancel link</button>':'')+'</td></tr>';
+      }).join(""):'<tr><td colspan="5" class="muted">No links yet.</td></tr>';
+    }).catch(function(e){$("setupBody").innerHTML='<div class="msg err">'+esc(e.message)+'</div>'});
+  }
+
+  document.addEventListener("click",function(ev){
+    var b=ev.target.closest("button"); if(!b)return;
+    if(b.dataset.copy){copy(b.dataset.copy,b);return}
+    if(b.dataset.revoke){if(!confirm("Cancel this registration link?"))return;call("POST","/invites/"+encodeURIComponent(b.dataset.revoke)+"/revoke").then(load).catch(function(e){msg($("invOut"),"err",e.message)});return}
+    var act=b.dataset.act,id=b.dataset.id; if(!act)return;
+    if(act==="reset"){call("POST","/users/"+id+"/reset-link").then(function(r){$("userOut").innerHTML='<div class="msg ok">Password reset link (expires in '+r.expires_minutes+' minutes):<div class="linkbox"><input readonly value="'+esc(r.link)+'"><button class="small" onclick="__copy(this.previousElementSibling.value,this)">Copy</button></div></div>'}).catch(function(e){msg($("userOut"),"err",e.message)})}
+    if(act==="sync"){b.disabled=true;call("POST","/users/"+id+"/sync").then(load).catch(function(e){msg($("userOut"),"err",e.message)})}
+    if(act==="disable"){if(!confirm("Disable this LO's login? (Billing in Stripe is not changed.)"))return;call("POST","/users/"+id+"/disable",{}).then(load).catch(function(e){msg($("userOut"),"err",e.message)})}
+    if(act==="enable"){call("POST","/users/"+id+"/disable",{enable:true}).then(load).catch(function(e){msg($("userOut"),"err",e.message)})}
+  });
+
+  $("createBtn").onclick=function(){
+    var btn=this; btn.disabled=true;
+    call("POST","/invites",{setup_price_id:$("setupSel").value,sub_price_id:$("subSel").value,email:$("email").value,note:$("note").value,expires_days:$("days").value})
+      .then(function(r){
+        $("createOut").innerHTML='<div class="msg ok">Link created — expires in '+r.expires_days+' days. Send it to the LO:<div class="linkbox"><input readonly value="'+esc(r.link)+'"><button class="small" onclick="__copy(this.previousElementSibling.value,this)">Copy</button></div></div>';
+        $("email").value="";$("note").value="";btn.disabled=false;load();
+      }).catch(function(e){msg($("createOut"),"err",e.message);btn.disabled=false});
+  };
+  load();
+})();
+</script>
+</body>
+</html>
