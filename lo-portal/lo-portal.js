@@ -26,7 +26,7 @@ const SESSION_DAYS = 14;
 const INVITE_DAYS_DEFAULT = 14;
 const RESET_MINUTES = 60;
 const NOTICE_DAYS = 30;
-const ALLOWED_ORIGINS = ["https://turturhomeloans.com", "https://www.turturhomeloans.com"];
+const ALLOWED_ORIGINS = ["https://turturhomeloans.com", "https://www.turturhomeloans.com", "https://myemployeeportal.turturhomeloans.com"];
 const WEBHOOK_EVENTS = [
   "checkout.session.completed",
   "checkout.session.async_payment_succeeded",
@@ -387,6 +387,38 @@ export function mountLoPortal(app, deps) {
   function paymentPending(u) {
     return !needsPayment(u) && !u.initial_paid_at && !u.setup_paid_at;
   }
+
+  // ---------- dedicated portal host (myemployeeportal.turturhomeloans.com) ----------
+  // On this hostname bonzo-sync serves ONLY the portal page + its /lo-portal API. Every other
+  // bonzo-sync route (lead intake, admin, webhooks, etc.) returns 404 on this host.
+  const PORTAL_HOST = String(process.env.LO_PORTAL_HOST || "myemployeeportal.turturhomeloans.com").toLowerCase();
+  const LOGO_URL = "https://turturhomeloans.com/wp-content/uploads/2026/01/TurturHomeLoans-Logo-Horz-Main-e1778185862773-768x195.png";
+  function portalPageHtml() {
+    return '<!doctype html><html lang="en"><head><meta charset="utf-8">' +
+      '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+      '<meta name="robots" content="noindex,nofollow,noarchive,nosnippet">' +
+      '<title>Loan Officer Portal | Turtur Home Loans</title>' +
+      '<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>' +
+      '<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700&family=Prata&family=Crimson+Text:wght@400;600&display=swap">' +
+      '<style>html,body{margin:0;padding:0;background:#fff}</style></head><body>' +
+      '<div id="lo-portal" style="min-height:100vh;background:#fff;font-family:Montserrat,sans-serif;color:#434A56;text-align:center;padding:18px 16px">' +
+      '<img src="' + LOGO_URL + '" alt="Turtur Home Loans" width="260" height="66" style="display:block;margin:0 auto 40px;width:260px;max-width:70vw;height:auto">' +
+      '<p style="color:#0A375F">Loading the Loan Officer Portal…</p></div>' +
+      '<script src="/lo-portal/app.js"></script></body></html>';
+  }
+  app.use((req, res, next) => {
+    const host = String(req.headers.host || "").split(":")[0].toLowerCase();
+    if (host !== PORTAL_HOST) return next();
+    res.setHeader("X-Robots-Tag", "noindex, nofollow, noarchive");
+    if (req.path.startsWith("/lo-portal/admin")) return res.status(404).type("text/plain").send("Not found");
+    if (req.path.startsWith("/lo-portal/")) return next();
+    if (req.path === "/robots.txt") return res.type("text/plain").send("User-agent: *\nDisallow: /\n");
+    if ((req.method === "GET" || req.method === "HEAD") && (req.path === "/" || req.path === "/index.html")) {
+      res.setHeader("Cache-Control", "no-cache");
+      return res.type("html").send(portalPageHtml());
+    }
+    return res.status(404).type("text/plain").send("Not found");
+  });
 
   // ---------- CORS for /lo-portal (public routes) ----------
   app.use("/lo-portal", (req, res, next) => {
