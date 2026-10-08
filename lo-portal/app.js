@@ -8,39 +8,71 @@
   var TOKEN_KEY = "thl_lo_token";
   var cfg = null, stripeJs = null, activeCheckout = null;
 
-  // ---------- styles ----------
+  // ---------- styles (matches turturhomeloans.com: Prata / Montserrat / Crimson Text, navy #0A375F, blue #3D8CC8) ----------
+  (function () {
+    if (document.querySelector("link[data-lo-fonts]")) return;
+    var l = document.createElement("link"); l.rel = "stylesheet"; l.setAttribute("data-lo-fonts", "1");
+    l.href = "https://fonts.googleapis.com/css2?family=Montserrat:wght@400;500;600;700&family=Prata&family=Crimson+Text:wght@400;600&display=swap";
+    document.head.appendChild(l);
+  })();
+  var LOGO = "https://turturhomeloans.com/wp-content/uploads/2026/01/TurturHomeLoans-Logo-Horz-Main-e1778185862773-768x195.png";
   var css = "" +
-    "#lo-portal{--navy:#0f2a44;--ink:#1d2733;--muted:#5b6876;--line:#dde3ea;--bg:#f5f7fa;--ok:#1f7a4d;--warn:#a15c00;--bad:#b42318;--accent:#c8a24a;" +
-    "font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:var(--ink);background:var(--bg);min-height:100vh;padding:0 0 48px;box-sizing:border-box;font-size:16px;line-height:1.5}" +
+    "html,body{margin:0;padding:0;background:#fff}" +
+    "#lo-portal{--navy:#0A375F;--head:#13263A;--blue:#3D8CC8;--blue-d:#2f78ae;--light:#D1DFE9;--soft:#EEF4F9;--ink:#434A56;--muted:#6b7480;--line:#D1DFE9;--ok:#1f7a4d;--warn:#9a5a00;--bad:#b42318;" +
+    "font-family:Montserrat,sans-serif!important;color:var(--ink)!important;background:#fff!important;min-height:100vh;display:flex;flex-direction:column;box-sizing:border-box;font-size:16px;line-height:1.55;padding:0!important}" +
     "#lo-portal *{box-sizing:border-box}" +
-    "#lo-portal .lp-top{background:var(--navy);color:#fff;padding:16px}" +
-    "#lo-portal .lp-top-in{max-width:880px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}" +
-    "#lo-portal .lp-brand{font-weight:700;letter-spacing:.3px}#lo-portal .lp-brand small{display:block;font-weight:400;opacity:.8;font-size:13px}" +
-    "#lo-portal .lp-wrap{max-width:880px;margin:24px auto 0;padding:0 16px}" +
-    "#lo-portal .lp-card{background:#fff;border:1px solid var(--line);border-radius:10px;padding:20px;margin:0 0 16px}" +
-    "#lo-portal h1{font-size:24px;margin:0 0 8px;color:var(--navy)}#lo-portal h2{font-size:18px;margin:0 0 12px;color:var(--navy)}" +
+    "#lo-portal .lp-top{background:#fff;padding:18px 16px;text-align:center;border-bottom:1px solid var(--light)}" +
+    "#lo-portal .lp-top img{display:block;margin:0 auto;width:260px;max-width:70vw;height:auto}" +
+    "#lo-portal .lp-main{flex:1 0 auto;background:linear-gradient(180deg,#fff 0,var(--soft) 100%);padding:28px 0 48px}" +
+    "#lo-portal .lp-wrap{max-width:880px;margin:0 auto;padding:0 16px}" +
+    "#lo-portal .lp-card{background:#fff;border:2px solid var(--navy);border-radius:14px;padding:22px;margin:0 0 18px;box-shadow:0 6px 18px rgba(10,55,95,.08)}" +
+    "#lo-portal h1,#lo-portal h2{font-family:Prata,serif;color:var(--head);font-weight:600;letter-spacing:-.2px}" +
+    "#lo-portal h1{font-size:28px;line-height:1.2;margin:0 0 10px}#lo-portal h2{font-size:21px;margin:0 0 12px}" +
     "#lo-portal p{margin:0 0 12px}#lo-portal .lp-muted{color:var(--muted);font-size:14px}" +
-    "#lo-portal label{display:block;font-size:14px;font-weight:600;margin:12px 0 4px}" +
-    "#lo-portal input[type=text],#lo-portal input[type=email],#lo-portal input[type=tel],#lo-portal input[type=password]{width:100%;padding:10px 12px;border:1px solid #c5ced8;border-radius:8px;font-size:16px;background:#fff;color:var(--ink)}" +
+    "#lo-portal label{display:block;font-size:14px;font-weight:600;color:var(--navy);margin:12px 0 4px}" +
+    "#lo-portal input[type=text],#lo-portal input[type=email],#lo-portal input[type=tel],#lo-portal input[type=password]{width:100%;padding:11px 13px;border:1px solid #9fb3c6;border-radius:4px;font-family:Montserrat,sans-serif;font-size:16px;background:#fff;color:var(--head)}" +
+    "#lo-portal input:focus{outline:2px solid var(--blue);outline-offset:1px;border-color:var(--blue)}" +
     "#lo-portal .lp-row{display:flex;gap:12px;flex-wrap:wrap}#lo-portal .lp-row>div{flex:1 1 220px}" +
-    "#lo-portal button.lp-btn{background:var(--navy);color:#fff;border:0;border-radius:8px;padding:11px 18px;font-size:15px;font-weight:600;cursor:pointer;margin:12px 8px 0 0}" +
+    "#lo-portal button.lp-btn{background:var(--blue);color:#fff;border:2px solid var(--blue);border-radius:20px;padding:10px 22px;font-family:Montserrat,sans-serif;font-size:15px;font-weight:700;cursor:pointer;margin:14px 8px 0 0}" +
+    "#lo-portal button.lp-btn:hover{background:var(--blue-d);border-color:var(--blue-d)}" +
     "#lo-portal button.lp-btn:disabled{opacity:.55;cursor:default}" +
-    "#lo-portal button.lp-sec{background:#fff;color:var(--navy);border:1px solid var(--navy)}" +
-    "#lo-portal button.lp-danger{background:#fff;color:var(--bad);border:1px solid var(--bad)}" +
-    "#lo-portal button.lp-link{background:none;border:0;color:var(--navy);text-decoration:underline;cursor:pointer;padding:0;font-size:14px;margin-top:12px}" +
-    "#lo-portal .lp-err{background:#fdecea;color:var(--bad);border-radius:8px;padding:10px 12px;margin:12px 0 0;font-size:14px}" +
-    "#lo-portal .lp-okmsg{background:#e8f5ee;color:var(--ok);border-radius:8px;padding:10px 12px;margin:0 0 16px;font-size:14px}" +
-    "#lo-portal .lp-terms{white-space:pre-wrap;font-size:13px;border:1px solid var(--line);border-radius:8px;padding:12px;max-height:220px;overflow:auto;background:#fafbfc}" +
-    "#lo-portal .lp-check{display:flex;gap:10px;align-items:flex-start;font-weight:400;margin-top:12px}#lo-portal .lp-check input{margin-top:4px;width:18px;height:18px;flex:none}" +
-    "#lo-portal table{width:100%;border-collapse:collapse;font-size:14px}#lo-portal th,#lo-portal td{text-align:left;padding:8px 6px;border-bottom:1px solid var(--line)}#lo-portal th{color:var(--muted);font-weight:600}" +
+    "#lo-portal button.lp-sec{background:#fff;color:var(--blue)}#lo-portal button.lp-sec:hover{background:var(--soft);color:var(--navy)}" +
+    "#lo-portal button.lp-danger{background:#fff;color:var(--bad);border-color:var(--bad)}#lo-portal button.lp-danger:hover{background:#fdecea}" +
+    "#lo-portal button.lp-link{background:none;border:0;color:var(--blue);text-decoration:underline;cursor:pointer;padding:0;font-family:Montserrat,sans-serif;font-size:14px;margin-top:12px}" +
+    "#lo-portal .lp-err{background:#fdecea;color:var(--bad);border-radius:6px;padding:10px 12px;margin:12px 0 0;font-size:14px}" +
+    "#lo-portal .lp-okmsg{background:#e8f5ee;color:var(--ok);border:1px solid #bfe3cf;border-radius:8px;padding:10px 12px;margin:0 0 18px;font-size:14px}" +
+    "#lo-portal .lp-terms{white-space:pre-wrap;font-size:13px;border:1px solid var(--line);border-radius:6px;padding:12px;max-height:220px;overflow:auto;background:var(--soft);color:var(--head)}" +
+    "#lo-portal .lp-check{display:flex;gap:10px;align-items:flex-start;font-weight:500;color:var(--ink);margin-top:12px}#lo-portal .lp-check input{margin-top:4px;width:18px;height:18px;flex:none;accent-color:var(--blue);appearance:auto;-webkit-appearance:checkbox;opacity:1;position:static}" +
+    "#lo-portal table{width:100%;border-collapse:collapse;font-size:14px}#lo-portal th,#lo-portal td{text-align:left;padding:9px 6px;border-bottom:1px solid var(--line)}#lo-portal th{color:var(--navy);font-weight:600}" +
+    "#lo-portal td a{color:var(--blue)}" +
     "#lo-portal .lp-scroll{overflow-x:auto}" +
-    "#lo-portal .lp-badge{display:inline-block;border-radius:999px;padding:2px 10px;font-size:13px;font-weight:600}" +
+    "#lo-portal .lp-badge{display:inline-block;border-radius:999px;padding:3px 12px;font-size:13px;font-weight:600}" +
     "#lo-portal .b-ok{background:#e8f5ee;color:var(--ok)}#lo-portal .b-warn{background:#fff4e0;color:var(--warn)}#lo-portal .b-bad{background:#fdecea;color:var(--bad)}" +
-    "#lo-portal .lp-items div{display:flex;justify-content:space-between;gap:12px;padding:6px 0;border-bottom:1px dashed var(--line)}" +
-    "#lo-portal .lp-test{background:#fff4e0;color:var(--warn);text-align:center;font-size:13px;padding:6px;font-weight:600}" +
-    "#lo-portal .lp-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px}" +
-    "#lo-portal .lp-big{font-size:20px;font-weight:700;color:var(--navy)}" +
-    "#lo-portal .lp-checkout{min-height:120px;margin-top:12px}";
+    "#lo-portal .lp-items div{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px dashed var(--line);color:var(--head)}" +
+    "#lo-portal .lp-test{background:#fff4e0;color:var(--warn);text-align:center;font-size:13px;padding:8px;font-weight:600;border-radius:8px;margin:0 0 18px}" +
+    "#lo-portal .lp-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:18px}#lo-portal .lp-grid .lp-card{margin:0}" +
+    "#lo-portal .lp-grid{margin-bottom:18px}" +
+    "#lo-portal .lp-big{font-family:Prata,serif;font-size:24px;color:var(--head)}" +
+    "#lo-portal .lp-hello{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap}#lo-portal .lp-hello button{margin-top:0}" +
+    "#lo-portal .lp-checkout{min-height:120px;margin-top:12px}" +
+    "#lo-portal .lp-foot{background:var(--navy);color:#fff;padding:26px 16px}" +
+    "#lo-portal .lp-foot-in{max-width:1100px;margin:0 auto;display:flex;align-items:center;justify-content:space-between;gap:12px 28px;flex-wrap:wrap}" +
+    "#lo-portal .lp-foot-name{font-family:'Crimson Text',serif;font-size:32px;line-height:1.1;margin-right:18px}" +
+    "#lo-portal .lp-foot-nmls{font-size:19px}" +
+    "#lo-portal .lp-foot-left{display:flex;align-items:baseline;flex-wrap:wrap;gap:4px 0}" +
+    "#lo-portal .lp-foot-ehl{font-size:16px}" +
+    /* hard resets against the WordPress theme's global element styles */
+    "#lo-portal h1,#lo-portal h2{font-family:Prata,serif!important;color:var(--head)!important;text-transform:none!important}" +
+    "#lo-portal h1{font-size:30px!important;line-height:1.2!important;margin:0 0 10px!important}" +
+    "#lo-portal h2{font-size:21px!important;line-height:1.3!important;margin:0 0 12px!important}" +
+    "#lo-portal p,#lo-portal label,#lo-portal span,#lo-portal div,#lo-portal td,#lo-portal th,#lo-portal a,#lo-portal input,#lo-portal button{font-family:Montserrat,sans-serif}" +
+    "#lo-portal label{font-family:Montserrat,sans-serif!important;font-size:14px!important;line-height:1.4!important}" +
+    "#lo-portal input[type=text],#lo-portal input[type=email],#lo-portal input[type=tel],#lo-portal input[type=password]{margin:0!important;height:auto!important;box-shadow:none!important;line-height:1.4!important}" +
+    "#lo-portal table,#lo-portal th,#lo-portal td{border:0!important;background:transparent!important}" +
+    "#lo-portal th,#lo-portal td{border-bottom:1px solid var(--line)!important;padding:9px 8px!important;font-size:14px!important}" +
+    "#lo-portal table{margin:0!important}" +
+    "#lo-portal .lp-big{font-family:Prata,serif!important}#lo-portal .lp-foot-name{font-family:'Crimson Text',serif!important}" +
+    "@media (max-width:640px){#lo-portal h1{font-size:25px!important}#lo-portal .lp-foot-in{flex-direction:column;align-items:flex-start}#lo-portal .lp-foot-name{font-size:28px}}";
   var st = document.createElement("style"); st.textContent = css; document.head.appendChild(st);
 
   // ---------- utils ----------
@@ -76,12 +108,15 @@
   function shell(content, opts) {
     opts = opts || {};
     ROOT.innerHTML = "";
-    if (cfg && cfg.mode === "test") ROOT.appendChild(h("div", { class: "lp-test", text: "TEST MODE — no real charges. Use card 4242 4242 4242 4242, any future date, any CVC." }));
-    var right = opts.loggedIn ? h("button", { class: "lp-btn lp-sec", style: "margin:0;background:transparent;color:#fff;border-color:#fff", onclick: logout, text: "Log out" }) : null;
-    ROOT.appendChild(h("div", { class: "lp-top" }, [h("div", { class: "lp-top-in" }, [h("div", { class: "lp-brand", html: "Turtur Home Loans<small>Loan Officer Portal</small>" }), right])]));
+    ROOT.appendChild(h("div", { class: "lp-top" }, [h("img", { src: LOGO, alt: "Turtur Home Loans", width: "260", height: "66" })]));
     var wrap = h("div", { class: "lp-wrap" });
+    if (cfg && cfg.mode === "test") wrap.appendChild(h("div", { class: "lp-test", text: "TEST MODE — no real charges. Use card 4242 4242 4242 4242, any future date, any CVC." }));
     (Array.isArray(content) ? content : [content]).forEach(function (c) { if (c) wrap.appendChild(c); });
-    ROOT.appendChild(wrap);
+    ROOT.appendChild(h("div", { class: "lp-main" }, [wrap]));
+    ROOT.appendChild(h("div", { class: "lp-foot" }, [h("div", { class: "lp-foot-in" }, [
+      h("div", { class: "lp-foot-left" }, [h("span", { class: "lp-foot-name", text: "Turtur Home Loans" }), h("span", { class: "lp-foot-nmls", text: "NMLS #2836215" })]),
+      h("div", { class: "lp-foot-ehl", text: "Equal Housing Lender" })
+    ])]));
     window.scrollTo(0, 0);
   }
   function loading(msg) { shell(h("div", { class: "lp-card" }, [h("p", { text: msg || "Loading…" }), h("p", { class: "lp-muted", text: "The first load can take up to a minute while the server wakes up." })])); }
@@ -154,7 +189,7 @@
     var total = 0, cur = "usd";
     var rows = items.map(function (it) {
       total += Number(it.amount || 0); cur = it.currency || cur;
-      var label = it.name + (it.kind === "setup" ? " (one-time)" : it.interval === "month" ? " — first month now, then billed on the 1st of each month" : "");
+      var label = it.name + (it.kind === "setup" ? " (one-time)" : "");
       var amt = money(it.amount, it.currency) + (it.interval ? " / " + (it.interval_count > 1 ? it.interval_count + " " + it.interval + "s" : it.interval) : "");
       return h("div", {}, [h("span", { text: label }), h("strong", { text: amt })]);
     });
@@ -214,7 +249,7 @@
     api("GET", "/me").then(function (me) {
       var parts = [];
       if (msg) parts.push(h("div", { class: "lp-okmsg", text: msg }));
-      parts.push(h("div", { class: "lp-card" }, [h("h1", { text: "Hi " + me.profile.first_name }), h("p", {}, [statusBadge(me)]),
+      parts.push(h("div", { class: "lp-card" }, [h("div", { class: "lp-hello" }, [h("div", {}, [h("h1", { text: "Hi " + me.profile.first_name }), h("p", {}, [statusBadge(me)])]), h("button", { class: "lp-btn lp-sec", text: "Log out", onclick: logout })]),
         me.plan.payment_pending ? h("p", { class: "lp-muted", text: "Your first payment is processing. Bank (ACH) payments can take up to 4 business days to clear." }) : null]));
 
       if (me.plan.needs_payment) {
