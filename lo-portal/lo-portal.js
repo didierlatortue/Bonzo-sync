@@ -220,6 +220,9 @@ export function mountLoPortal(app, deps) {
   }
 
   // ---------- email ----------
+  function mailConfigured() {
+    return !!(process.env.OUTLOOK_MAILBOX && process.env.MS_TENANT_ID && process.env.MS_CLIENT_ID && process.env.MS_CLIENT_SECRET && getMsGraphToken);
+  }
   async function sendMail(to, subject, html) {
     const mailbox = process.env.OUTLOOK_MAILBOX;
     if (!mailbox || !getMsGraphToken) throw new Error("mail not configured");
@@ -237,7 +240,7 @@ export function mountLoPortal(app, deps) {
   }
   function notifyOwner(subject, lines) {
     const to = process.env.LO_NOTIFY_EMAIL || process.env.OUTLOOK_MAILBOX;
-    if (!to) return;
+    if (!to || !mailConfigured()) return;
     const html = "<div style='font-family:Arial,sans-serif;font-size:14px'>" + lines.map((l) => "<div>" + esc(l) + "</div>").join("") + "</div>";
     sendMail(to, "[LO Portal" + (stripeMode() === "test" ? " TEST" : "") + "] " + subject, html).catch((e) => log("notify failed:", e.message));
   }
@@ -525,6 +528,9 @@ export function mountLoPortal(app, deps) {
     if (limited(req, "forgot", 5, 900000)) return res.status(429).json({ ok: false, error: "Too many attempts. Try again later." });
     const email = normEmail(req.body && req.body.email);
     const pool = await db();
+    if (!mailConfigured()) {
+      return res.json({ ok: true, message: "Password reset by email is not available yet. Contact Turtur Home Loans and we will send you a reset link." });
+    }
     const { rows } = await pool.query("SELECT * FROM lo_users WHERE mode=$1 AND email=$2 AND NOT disabled", [stripeMode(), email]);
     if (rows[0]) {
       const link = await createResetLink(rows[0].id);
@@ -883,7 +889,7 @@ export function mountLoPortal(app, deps) {
     const invites = (await pool.query("SELECT token_hint,email,note,setup_price_id,sub_price_id,expires_at,used_at,revoked_at,lo_user_id,link,created_at FROM lo_invites WHERE mode=$1 ORDER BY created_at DESC LIMIT 100", [stripeMode()])).rows;
     const users = (await pool.query("SELECT id,email,first_name,last_name,phone,setup_price_id,sub_price_id,subscription_status,setup_paid_at,current_period_end,cancel_at,cancel_requested_at,agreement_version,agreement_accepted_at,disabled,created_at FROM lo_users WHERE mode=$1 ORDER BY created_at DESC", [stripeMode()])).rows;
     const wh = await webhookSecret();
-    res.json({ ok: true, mode: stripeMode(), portal_url: portalUrl(), webhook_connected: !!wh, publishable_key_set: !!process.env.STRIPE_PUBLISHABLE_KEY, prices: list, invites, users });
+    res.json({ ok: true, mode: stripeMode(), portal_url: portalUrl(), webhook_connected: !!wh, publishable_key_set: !!process.env.STRIPE_PUBLISHABLE_KEY, email_configured: mailConfigured(), prices: list, invites, users });
   }));
 
   app.post("/lo-portal/admin/:code/invites", json, adminWrap(async (req, res) => {

@@ -80,7 +80,7 @@ table{width:100%;border-collapse:collapse;font-size:13px}th,td{text-align:left;p
       var s=[];
       s.push((j.webhook_connected?'<span class="pill p-ok">Stripe webhook connected</span>':'<span class="pill p-bad">Stripe webhook not connected</span>')+' <button class="small sec" id="whBtn">'+(j.webhook_connected?"Reconnect":"Connect")+' webhook</button>');
       s.push(j.publishable_key_set?'<span class="pill p-ok">Publishable key set</span>':'<span class="pill p-bad">Publishable key missing</span>');
-      s.push('<button class="small sec" id="mailBtn">Send test email</button>');
+      s.push(j.email_configured?'<span class="pill p-ok">Email sending set up</span> <button class="small sec" id="mailBtn">Send test email</button>':'<span class="pill p-warn">Email sending not set up — password resets: use "Reset link" below</span><button id="mailBtn" style="display:none"></button>');
       s.push('<div class="muted" style="margin-top:8px">Portal page: <a href="'+esc(j.portal_url)+'" target="_blank" rel="noopener">'+esc(j.portal_url)+'</a></div>');
       $("setupBody").innerHTML=s.join(" ")+'<div id="setupOut"></div>';
       $("whBtn").onclick=function(){this.disabled=true;call("POST","/connect-webhook").then(function(r){msg($("setupOut"),"ok","Webhook connected ("+r.mode+"): "+r.url);load()}).catch(function(e){msg($("setupOut"),"err",e.message)})};
