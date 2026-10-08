@@ -5,6 +5,7 @@
   var API = (SCRIPT && SCRIPT.src ? new URL(SCRIPT.src).origin : "https://bonzo-sync.onrender.com") + "/lo-portal";
   var ROOT = document.getElementById("lo-portal");
   if (!ROOT) { ROOT = document.createElement("div"); ROOT.id = "lo-portal"; document.body.appendChild(ROOT); }
+  ROOT.removeAttribute("style"); // drop the WordPress loading-placeholder styling
   var TOKEN_KEY = "thl_lo_token";
   var cfg = null, stripeJs = null, activeCheckout = null;
 
@@ -19,7 +20,7 @@
   var css = "" +
     "html,body{margin:0;padding:0;background:#fff}" +
     "#lo-portal{--navy:#0A375F;--head:#13263A;--blue:#3D8CC8;--blue-d:#2f78ae;--light:#D1DFE9;--soft:#EEF4F9;--ink:#434A56;--muted:#6b7480;--line:#D1DFE9;--ok:#1f7a4d;--warn:#9a5a00;--bad:#b42318;" +
-    "font-family:Montserrat,sans-serif!important;color:var(--ink)!important;background:#fff!important;min-height:100vh;display:flex;flex-direction:column;box-sizing:border-box;font-size:16px;line-height:1.55;padding:0!important}" +
+    "font-family:Montserrat,sans-serif!important;color:var(--ink)!important;background:#fff!important;min-height:100vh;display:flex;flex-direction:column;text-align:left;box-sizing:border-box;font-size:16px;line-height:1.55;padding:0!important}" +
     "#lo-portal *{box-sizing:border-box}" +
     "#lo-portal .lp-top{background:#fff;padding:18px 16px;text-align:center;border-bottom:1px solid var(--light)}" +
     "#lo-portal .lp-top img{display:block;margin:0 auto;width:260px;max-width:70vw;height:auto}" +
