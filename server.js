@@ -4330,15 +4330,53 @@ function _num(v) {
   return Number.isFinite(n) ? n : undefined;
 }
 
+
+// Elementor's webhook posts a FLAT object keyed by the field LABEL, not by custom_id,
+// and acceptance/html fields arrive as "No Label <custom_id>". Measured 2026-10-12.
+// This normalises any of those shapes to our canonical field names.
+const AVEN_LABEL_MAP = {
+  first_name:"first_name", last_name:"last_name", email_address:"email", email:"email",
+  mobile_phone:"phone_number", phone:"phone_number", phone_number:"phone_number",
+  date_of_birth:"date_of_birth", social_security_number:"ssn", ssn:"ssn",
+  property_street_address:"property_street", property_street:"property_street",
+  unit_apt:"property_unit", property_unit:"property_unit",
+  city:"property_city", property_city:"property_city",
+  zip_code:"property_zip", property_zip:"property_zip", property_state:"property_state",
+  property_type:"property_type",
+  how_you_use_the_property:"property_residence_type", property_residence_type:"property_residence_type",
+  what_the_money_is_for:"loan_usage", loan_usage:"loan_usage",
+  how_much_you_want:"loan_amount", loan_amount:"loan_amount",
+  estimated_home_value:"home_value", home_value:"home_value",
+  mortgage_balance_remaining:"first_mortgage_balance", first_mortgage_balance:"first_mortgage_balance",
+  second_mortgage_or_heloc:"has_second_mortgage", has_second_mortgage:"has_second_mortgage",
+  employment:"employment_status", employment_status:"employment_status",
+  annual_income:"annual_income",
+  estimated_credit_score:"estimated_credit_score",
+  soft_pull_approved:"soft_pull_approved", consent_contact:"consent_contact",
+  lead_source:"lead_source", page_url:"page_url", lead_id:"lead_id",
+};
+function _avenSlug(k) {
+  return String(k || "").replace(/^No Label\s+/i, "")
+    .trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+}
+function avenNormaliseFields(body) {
+  const src = (body && body.fields && typeof body.fields === "object") ? body.fields : (body || {});
+  const out = {};
+  for (const [k, v] of Object.entries(src)) {
+    const val = (v && typeof v === "object" && "value" in v) ? v.value : v;
+    const slug = _avenSlug(k);
+    const canon = AVEN_LABEL_MAP[slug] || slug;
+    if (out[canon] === undefined || out[canon] === "") out[canon] = val;
+  }
+  return out;
+}
+
 app.post("/aven/heloc/:code", express.json(), express.urlencoded({ extended: true }), async (req, res) => {
   if (req.params.code !== process.env.LEAD_INBOUND_CODE) return res.status(401).send("Unauthorized");
   if (!AVEN_KEY) return res.status(500).json({ ok: false, error: "AVEN_API_KEY not configured" });
 
-  console.log("[aven/heloc] ct=" + (req.header("content-type") || "-") +
-              " bodyKeys=" + JSON.stringify(Object.keys(req.body || {})).slice(0,300) +
-              " raw=" + JSON.stringify(req.body).slice(0, 700));
-  const f = _coworkExtractAttribution(req.body) || {};
-  console.log("[aven/heloc] flatKeys=" + JSON.stringify(Object.keys(f)).slice(0,500));
+  const f = avenNormaliseFields(req.body);
+  console.log("[aven/heloc] fields=" + JSON.stringify(Object.keys(f)).slice(0, 400));
   const email = String(f.email || "").trim();
   const phone = String(f.phone || f.phone_number || "").replace(/\D/g, "");
 
