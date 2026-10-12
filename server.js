@@ -5,6 +5,7 @@ import { mountLoPortal } from "./lo-portal/lo-portal.js";
 
 import { createHash as _coworkCreateHash } from "crypto";
 import { createCipheriv as _plaidCipheriv, createDecipheriv as _plaidDecipheriv, randomBytes as _plaidRandomBytes } from "crypto";
+import { createHmac as _avenHmac, timingSafeEqual as _avenTimingSafeEqual } from "crypto";
 const app = express();
 // === COWORK 2026-10-07: LO portal (Stripe subscriptions for loan officers) ===
 // Mounted BEFORE the global express.json() so /lo-portal/stripe/webhook gets the raw body for signature checks.
@@ -4391,13 +4392,12 @@ function avenSignatureOk(req) {
   const sent = req.header("x-aven-signature") || req.header("X-Aven-Signature") || "";
   if (!sent) { console.warn("[aven/webhook] no x-aven-signature header"); return false; }
   try {
-    const crypto = require("crypto");
-    const mac = crypto.createHmac("sha256", AVEN_WEBHOOK_SECRET)
+    const mac = _avenHmac("sha256", AVEN_WEBHOOK_SECRET)
                       .update(req.rawBody || Buffer.from(JSON.stringify(req.body || {})))
                       .digest("hex");
     const a = Buffer.from(mac, "utf8");
     const b = Buffer.from(String(sent).trim().replace(/^sha256=/, ""), "utf8");
-    return a.length === b.length && crypto.timingSafeEqual(a, b);
+    return a.length === b.length && _avenTimingSafeEqual(a, b);
   } catch (e) { console.error("[aven/webhook] sig check error:", e && e.message); return false; }
 }
 
