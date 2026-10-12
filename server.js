@@ -4394,8 +4394,12 @@ app.post("/aven/heloc/:code", express.json(), async (req, res) => {
 
   // Idempotency-Key is REQUIRED by Aven. Stable per borrower+property so a double
   // submit does not create two applications.
+  // Identity part dedupes a double-submit of the SAME data; the payload digest lets a
+  // borrower who fixes a typo and resubmits through as a NEW application instead of
+  // hitting Aven's 409 "Idempotency-Key was already used with a different request".
   const idem = _coworkCreateHash("sha256")
-      .update([email, phone, addr.street || "", addr.zipCode || ""].join("|").toLowerCase())
+      .update([email, phone, addr.street || "", addr.zipCode || ""].join("|").toLowerCase()
+              + "|" + JSON.stringify(payload))
       .digest("hex").slice(0, 32);
 
   let r;
