@@ -4293,12 +4293,13 @@ app.post("/arive/app-completed/:code", express.json(), async (req, res) => {
 // (a) /aven/heloc/:code   website form  -> POST /thirdPartyLead/create
 // (b) /aven/webhook/:code Aven checkpoint -> look up borrower -> stage move
 // ---------------------------------------------------------------------
-async function avenFetch(method, path, body) {
+async function avenFetch(method, path, body, extraHeaders) {
   const r = await fetch(AVEN_BASE + path, {
     method,
     headers: Object.assign(
       { "Authorization": "Bearer " + AVEN_KEY, "Accept": "application/json" },
-      body ? { "Content-Type": "application/json" } : {}
+      body ? { "Content-Type": "application/json" } : {},
+      extraHeaders || {}
     ),
     body: body ? JSON.stringify(body) : undefined,
   });
@@ -4315,6 +4316,9 @@ const AVEN_PROPERTY_TYPE = { "single family home": "Single Family Home", "single
 const AVEN_EMPLOYMENT = { employed: "Employed", "not employed": "Not Employed", unemployed: "Not Employed",
                           "self employed": "Self Employed", "self-employed": "Self Employed",
                           retired: "Retired", military: "Military", other: "Other" };
+const AVEN_USAGE = { homeimprovement:"Home Improvement", "home improvement":"Home Improvement",
+                     debtconsolidation:"Debt Consolidation", "debt consolidation":"Debt Consolidation",
+                     majorpurchase:"Major Purchase", "major purchase":"Major Purchase", other:"Other" };
 const AVEN_RESIDENCE = { primary: "PRIMARY", secondary: "SECONDARY", investment: "INVESTMENT" };
 
 function _mapEnum(table, v, dflt) {
@@ -4332,51 +4336,70 @@ app.post("/aven/heloc/:code", express.json(), async (req, res) => {
 
   const f = _coworkExtractAttribution(req.body) || {};
   const email = String(f.email || "").trim();
-  const phone = String(f.phone || f.phone_number || "").trim();
+  const phone = String(f.phone || f.phone_number || "").replace(/\D/g, "");
 
-  // The customer MUST have ticked soft-pull consent. Aven cannot take it later.
   const consentRaw = String(f.soft_pull_approved || f.softPullApproved || "").trim().toLowerCase();
-  const consented = ["1","true","yes","on","i authorize a soft credit inquiry to check my rate. this will not affect my credit score."]
-                      .includes(consentRaw) || consentRaw.startsWith("i authorize");
+  const consented = ["1","true","yes","on"].includes(consentRaw) || consentRaw.startsWith("i authorize");
   if (!consented) {
-    console.warn("[aven/heloc] refused — soft pull consent not present for", email || phone);
+    console.warn("[aven/heloc] refused - soft pull consent not present for", email || phone);
     return res.status(400).json({ ok: false, error: "soft_pull_consent_required" });
   }
 
-  const payload = {
-    leadId: String(f.lead_id || "").trim() || undefined,
-    firstName: f.first_name || undefined,
-    lastName: f.last_name || undefined,
-    email: email || undefined,
-    phone: phone || undefined,
-    dateOfBirth: f.date_of_birth || undefined,
-    propertyAddressStreet: f.property_street || undefined,
-    propertySecondaryAddressUnit: f.property_unit || undefined,
-    propertyCity: f.property_city || undefined,
-    propertyState: String(f.property_state || "FL").trim().toUpperCase().slice(0, 2),
-    propertyAddressPostalCode: f.property_zip || undefined,
-    propertyResidenceType: _mapEnum(AVEN_RESIDENCE, f.property_residence_type, "PRIMARY"),
-    propertyType: _mapEnum(AVEN_PROPERTY_TYPE, f.property_type, undefined),
-    loanUsage: _mapEnum(AVEN_LOAN_USAGE, f.loan_usage, undefined),
-    loanAmount: _num(f.loan_amount),
-    homeValue: f.home_value ? String(f.home_value) : undefined,
-    firstMortgageBalanceAmount: _num(f.first_mortgage_balance),
-    hasSecondMortgage: f.has_second_mortgage ? /^(1|true|yes|on)$/i.test(String(f.has_second_mortgage)) : undefined,
-    annualIncome: _num(f.annual_income),
-    employmentStatus: _mapEnum(AVEN_EMPLOYMENT, f.employment_status, undefined),
-    homeOwnershipStatus: "OWN",
-    creditProfileAmount: _num(f.estimated_credit_score),
-    type: "primary",
+  const addr = {
+    street: f.property_street || undefined,
+    unit: f.property_unit || undefined,
+    city: f.property_city || undefined,
+    state: String(f.property_state || "FL").trim().toUpperCase().slice(0, 2),
+    zipCode: String(f.property_zip || "").trim() || undefined,
   };
+  Object.keys(addr).forEach(k => addr[k] === undefined && delete addr[k]);
+
+  const residence = _mapEnum(AVEN_RESIDENCE, f.property_residence_type, "PRIMARY");
+  const usage = _mapEnum(AVEN_USAGE, f.loan_usage, "Home Improvement");
+
+  const payload = {
+    applicant: {
+      name: { firstName: f.first_name || "", lastName: f.last_name || "" },
+      dob: String(f.date_of_birth || "").trim(),          // YYYY-MM-DD, required by Aven
+      phone: phone,                                        // 10-12 digits, required
+      email: email,
+      homeAddress: Object.keys(addr).length ? addr : undefined,
+    },
+    financialInformation: _num(f.annual_income) !== undefined
+      ? { statedIncome: _num(f.annual_income) } : undefined,
+    property: { address: addr, residenceType: residence, statedUsage: usage },
+    loanOfficer: process.env.THLB_LO_NMLS ? { nmlsId: String(process.env.THLB_LO_NMLS) } : undefined,
+    behavior: { confirmLienAttestationBehavior: "AUTO" },
+    softPullApproved: true,
+  };
+  if (payload.applicant.homeAddress === undefined) delete payload.applicant.homeAddress;
   Object.keys(payload).forEach(k => payload[k] === undefined && delete payload[k]);
 
+  const missing = [];
+  if (!payload.applicant.name.firstName) missing.push("first_name");
+  if (!payload.applicant.name.lastName)  missing.push("last_name");
+  if (!payload.applicant.email)          missing.push("email");
+  if (!/^\d{10,12}$/.test(payload.applicant.phone)) missing.push("phone_number");
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(payload.applicant.dob)) missing.push("date_of_birth");
+  if (missing.length) {
+    console.warn("[aven/heloc] missing/invalid fields:", missing.join(","));
+    return res.status(400).json({ ok: false, error: "missing_fields", fields: missing });
+  }
+
+  // Idempotency-Key is REQUIRED by Aven. Stable per borrower+property so a double
+  // submit does not create two applications.
+  const idem = _coworkCreateHash("sha256")
+      .update([email, phone, addr.street || "", addr.zipCode || ""].join("|").toLowerCase())
+      .digest("hex").slice(0, 32);
+
   let r;
-  try { r = await avenFetch("POST", "/thirdPartyLead/create", payload); }
-  catch (e) {
+  try {
+    r = await avenFetch("POST", "/atp/application/start", payload, { "idempotency-key": idem });
+  } catch (e) {
     console.error("[aven/heloc] call failed:", e && e.message);
     return res.status(502).json({ ok: false, error: "aven_unreachable" });
   }
-  console.log("[aven/heloc] create ->", r.status, "email=" + (email || "-"),
+  console.log("[aven/heloc] start ->", r.status, "email=" + (email || "-"),
               "body=" + JSON.stringify(r.body).slice(0, 400));
   if (!r.ok) return res.status(502).json({ ok: false, aven_status: r.status, aven_body: r.body });
   return res.json({ ok: true, aven_status: r.status, aven: r.body });
