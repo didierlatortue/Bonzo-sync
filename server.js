@@ -4357,9 +4357,12 @@ app.post("/aven/heloc/:code", express.json(), async (req, res) => {
   const residence = _mapEnum(AVEN_RESIDENCE, f.property_residence_type, "PRIMARY");
   const usage = _mapEnum(AVEN_USAGE, f.loan_usage, "Home Improvement");
 
+  const ssn = String(f.ssn || f.social_security_number || "").replace(/\D/g, "");
+
   const payload = {
     applicant: {
       name: { firstName: f.first_name || "", lastName: f.last_name || "" },
+      ssn: ssn || undefined,
       dob: String(f.date_of_birth || "").trim(),          // YYYY-MM-DD, required by Aven
       phone: phone,                                        // 10-12 digits, required
       email: email,
@@ -4381,6 +4384,9 @@ app.post("/aven/heloc/:code", express.json(), async (req, res) => {
   if (!payload.applicant.email)          missing.push("email");
   if (!/^\d{10,12}$/.test(payload.applicant.phone)) missing.push("phone_number");
   if (!/^\d{4}-\d{2}-\d{2}$/.test(payload.applicant.dob)) missing.push("date_of_birth");
+  // Measured 2026-10-12: Aven returns NEEDS_SSN with no ssn and NEEDS_FULL_SSN with last-4.
+  // A full 9-digit SSN is required in practice despite the schema marking ssn optional.
+  if (!/^\d{9}$/.test(ssn)) missing.push("ssn");
   if (missing.length) {
     console.warn("[aven/heloc] missing/invalid fields:", missing.join(","));
     return res.status(400).json({ ok: false, error: "missing_fields", fields: missing });
@@ -4439,13 +4445,22 @@ app.post("/aven/webhook/:code", _avenRaw, async (req, res) => {
         console.log("[aven/webhook] checkpoint not in completion set — no action");
         return;
       }
-      const r = await avenFetch("GET", "/atp/applications");
-      if (!r.ok) { console.error("[aven/webhook] applications fetch failed", r.status); return; }
-      const rows = ((r.body || {}).payload || {}).data || [];
-      const app_ = rows.find(a => String(a.applicationId) === String(appId));
-      if (!app_) { console.warn("[aven/webhook] applicationId", appId, "not in scoped list"); return; }
-      const b = app_.borrower || {};
-      await bonzoMoveToAppCompleted(b.email, b.phoneNumber, "AVEN " + checkpoint + " appId=" + appId);
+      // /atp/applications lags behind new applications; /pii is authoritative and immediate.
+      let email = "", phone = "";
+      const pii = await avenFetch("GET", "/atp/application/" + appId + "/pii");
+      if (pii.ok) {
+        const apps = ((pii.body || {}).payload || {}).applicants || [];
+        const primary = apps.find(a => a.applicantType === "PRIMARY") || apps[0] || {};
+        email = primary.email || ""; phone = primary.phone || "";
+      } else {
+        console.warn("[aven/webhook] pii fetch failed", pii.status, "- falling back to list");
+        const r = await avenFetch("GET", "/atp/applications");
+        const rows = ((r.body || {}).payload || {}).data || [];
+        const app_ = rows.find(a => String(a.applicationId) === String(appId));
+        if (app_) { const b = app_.borrower || {}; email = b.email || ""; phone = b.phoneNumber || ""; }
+      }
+      if (!email && !phone) { console.warn("[aven/webhook] no borrower contact for appId", appId); return; }
+      await bonzoMoveToAppCompleted(email, phone, "AVEN " + checkpoint + " appId=" + appId);
     } catch (e) {
       console.error("[aven/webhook] error:", e && e.stack || e);
     }
