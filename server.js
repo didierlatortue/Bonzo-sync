@@ -4330,11 +4330,15 @@ function _num(v) {
   return Number.isFinite(n) ? n : undefined;
 }
 
-app.post("/aven/heloc/:code", express.json(), async (req, res) => {
+app.post("/aven/heloc/:code", express.json(), express.urlencoded({ extended: true }), async (req, res) => {
   if (req.params.code !== process.env.LEAD_INBOUND_CODE) return res.status(401).send("Unauthorized");
   if (!AVEN_KEY) return res.status(500).json({ ok: false, error: "AVEN_API_KEY not configured" });
 
+  console.log("[aven/heloc] ct=" + (req.header("content-type") || "-") +
+              " bodyKeys=" + JSON.stringify(Object.keys(req.body || {})).slice(0,300) +
+              " raw=" + JSON.stringify(req.body).slice(0, 700));
   const f = _coworkExtractAttribution(req.body) || {};
+  console.log("[aven/heloc] flatKeys=" + JSON.stringify(Object.keys(f)).slice(0,500));
   const email = String(f.email || "").trim();
   const phone = String(f.phone || f.phone_number || "").replace(/\D/g, "");
 
