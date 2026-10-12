@@ -3602,7 +3602,7 @@ app.post("/arive/webhook/:code", async (req, res) => {
         case "LEAD_UPDATED":
           await _ariveOnLead(event, leadId, body); break;
         case "LOAN_APP_SUBMITTED":
-          await _ariveOnLoanAppSubmitted(loanId); break;   // PRIMARY bid signal
+          await _ariveOnLoanAppSubmitted(loanId); await _ariveOnApplicationCompleted(loanId, body); break;   // PRIMARY bid signal + Bonzo stage move
         case "LOAN_CREATED":
           await _ariveOnLoanCreated(loanId); break;
         case "LOAN_STAGE_CHANGED":
@@ -4139,6 +4139,290 @@ app.get("/plaid/status/:code", async (req, res) => {
   return res.json({ ok: true, configured: plaidConfigured(), env: process.env.PLAID_ENV || "production", has_client_id: !!process.env.PLAID_CLIENT_ID, has_secret: !!process.env.PLAID_SECRET, trigger_stage: PLAID_TRIGGER_STAGE_ID });
 });
 // === END PLAID STATEMENTS ===
+
+
+// =====================================================================
+// === APPLICATION COMPLETED + AVEN HELOC  (added 2026-10-12) ==========
+// =====================================================================
+// HARD RULE (owner, 2026-10-11/12): never modify an existing Bonzo prospect's
+// fields — above all lead_source. The ONLY permitted write in this block is a
+// pipeline-stage move. No PUT, no PATCH, no tag writes, no upsert.
+
+const APP_COMPLETED_STAGE_ID =
+  process.env.BONZO_APP_COMPLETED_STAGE_ID || "495293"; // Realtor.com Leads > 🤑$ Application Completed ❤️‍🔥
+const AVEN_BASE = process.env.AVEN_API_BASE || "https://app.production.cluster.aven.com/backend";
+const AVEN_KEY  = process.env.AVEN_API_KEY || "";
+// Aven checkpoints that mean "the customer finished their side".
+const AVEN_COMPLETE_CHECKPOINTS = String(
+  process.env.AVEN_COMPLETE_CHECKPOINTS || "broker_application_submitted,pre_qual_offer_accepted,final_offer_accepted"
+).split(",").map(s => s.trim()).filter(Boolean);
+
+function _last10(v) {
+  const d = String(v || "").replace(/\D/g, "");
+  return d.length >= 10 ? d.slice(-10) : "";
+}
+
+// Find an existing prospect by email, then by phone. Read-only.
+async function bonzoFindProspectByEmailOrPhone(email, phone) {
+  if (email) {
+    try {
+      const exact = await bonzoResolveExactProspectsByEmail(email, {});
+      if (exact && exact.length) {
+        console.log("[app-completed] matched by email:", email, "-> prospect", getProspectIdMaybe(exact[0]));
+        return exact[0];
+      }
+    } catch (e) {
+      console.error("[app-completed] email match error:", e && e.message);
+    }
+  }
+  const want = _last10(phone);
+  if (want) {
+    for (const p of ["/prospects?phone=", "/prospects?query=", "/prospects?search="]) {
+      let out;
+      try { out = await bonzoFetch(p + encodeURIComponent(want), { method: "GET" }); }
+      catch { continue; }
+      if (!out || !out.ok) continue;
+      const j = out.json || {};
+      const list =
+        (Array.isArray(j.data) && j.data) ||
+        (j.data && Array.isArray(j.data.data) && j.data.data) ||
+        (Array.isArray(j.prospects) && j.prospects) ||
+        (Array.isArray(j.results) && j.results) || [];
+      for (const c of list.slice(0, 25)) {
+        const id = getProspectIdMaybe(c);
+        if (!id) continue;
+        let full = c;
+        if (!c.phone && !c.phone_number) {
+          const g = await bonzoFetch("/prospects/" + id, { method: "GET" });
+          full = (g && g.ok && (g.json && (g.json.data || g.json))) || c;
+        }
+        const cand = _last10(full.phone || full.phone_number || full.mobile_phone);
+        if (cand && cand === want) {
+          console.log("[app-completed] matched by phone:", want, "-> prospect", id);
+          return full;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+// The single permitted Bonzo write: move stage. Nothing else is touched.
+async function bonzoMoveToAppCompleted(email, phone, why) {
+  const p = await bonzoFindProspectByEmailOrPhone(email, phone);
+  if (!p) {
+    console.warn("[app-completed] NO MATCH for email=" + (email || "-") + " phone=" + (phone || "-") + " (" + why + ") — nothing written");
+    return { ok: false, reason: "prospect_not_found", email: email || null, phone: phone || null };
+  }
+  const id = getProspectIdMaybe(p);
+  const r = await bonzoFetch("/prospects/" + id + "/pipeline-stage/" + APP_COMPLETED_STAGE_ID, { method: "POST" });
+  console.log("[app-completed] stage move prospect=" + id + " stage=" + APP_COMPLETED_STAGE_ID +
+              " ok=" + (r && r.ok) + " (" + why + ") — no fields written, source untouched");
+  return { ok: !!(r && r.ok), prospect_id: id, stage_id: APP_COMPLETED_STAGE_ID, why };
+}
+
+// ---------------------------------------------------------------------
+// TASK 1 — ARIVE application complete -> Bonzo stage move
+// Reads borrower contact from the inline webhook payload when present,
+// and only falls back to the Arive REST API (which needs the 5-cred login)
+// if the payload carries no contact info.
+// ---------------------------------------------------------------------
+function _ariveExtractContact(raw) {
+  const f = raw || {};
+  const d = f.data || f.Data || {};
+  const b = f.borrower || f.Borrower || d.borrower || {};
+  const pick = (...keys) => {
+    for (const k of keys) {
+      for (const src of [f, d, b]) {
+        if (src && src[k] != null && String(src[k]).trim() !== "") return String(src[k]).trim();
+      }
+    }
+    return "";
+  };
+  return {
+    email: pick("email", "Email", "borrower_email", "borrowerEmail", "emailAddressText",
+                "borrower_emailAddressText", "loanBorrowers_emailAddressText", "Borrower Email Address"),
+    phone: pick("phone", "Phone", "mobile_phone", "mobilePhone", "mobilePhone10digit",
+                "borrower_mobilePhone10digit", "loanBorrowers_mobilePhone10digit", "Borrower Cell Phone#"),
+    first: pick("first_name", "firstName", "FirstName", "borrower_firstName", "Borrower First Name"),
+    last:  pick("last_name", "lastName", "LastName", "borrower_lastName", "Borrower Last Name"),
+  };
+}
+
+async function _ariveOnApplicationCompleted(loanId, rawBody) {
+  let c = _ariveExtractContact(rawBody);
+  if (!c.email && !c.phone && loanId) {
+    try {
+      const r = await _ariveFetch("GET", "/api/loans/" + loanId);
+      if (r && r.ok) {
+        const loan = r.body || {};
+        const b = (loan.Borrowers && loan.Borrowers[0]) || loan.Borrower || {};
+        c = { email: b.Email || b.email || "", phone: b.MobilePhone || b.Phone || b.phone || "",
+              first: b.FirstName || "", last: b.LastName || "" };
+      } else {
+        console.error("[arive/app-completed] loan fetch failed", r && r.status, "— payload had no contact info");
+      }
+    } catch (e) {
+      console.error("[arive/app-completed] loan fetch error:", e && e.message);
+    }
+  }
+  if (!c.email && !c.phone) {
+    console.warn("[arive/app-completed] loanId=" + loanId + " no email/phone anywhere — cannot match, nothing written");
+    return { ok: false, reason: "no_contact_info" };
+  }
+  return bonzoMoveToAppCompleted(c.email, c.phone, "ARIVE loan app submitted loanId=" + (loanId || "?"));
+}
+
+// Direct endpoint so the move can be driven by anything that can POST JSON
+// (Arive native webhook, a Zap, curl). Accepts {email, phone} or a full
+// Arive-style payload. Path code is the auth.
+app.post("/arive/app-completed/:code", express.json(), async (req, res) => {
+  if (req.params.code !== process.env.LEAD_INBOUND_CODE) return res.status(401).send("Unauthorized");
+  const body = req.body || {};
+  const loanId = body.LoanId || body.loanId || body.LoanID || null;
+  res.status(200).json({ ok: true, queued: true });
+  setImmediate(async () => {
+    try { await _ariveOnApplicationCompleted(loanId, body); }
+    catch (e) { console.error("[arive/app-completed] error:", e && e.stack || e); }
+  });
+});
+
+// ---------------------------------------------------------------------
+// TASK 2 — AVEN HELOC
+// (a) /aven/heloc/:code   website form  -> POST /thirdPartyLead/create
+// (b) /aven/webhook/:code Aven checkpoint -> look up borrower -> stage move
+// ---------------------------------------------------------------------
+async function avenFetch(method, path, body) {
+  const r = await fetch(AVEN_BASE + path, {
+    method,
+    headers: Object.assign(
+      { "Authorization": "Bearer " + AVEN_KEY, "Accept": "application/json" },
+      body ? { "Content-Type": "application/json" } : {}
+    ),
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  let out = null;
+  try { out = await r.json(); } catch { try { out = await r.text(); } catch {} }
+  return { status: r.status, ok: r.ok, body: out };
+}
+
+const AVEN_LOAN_USAGE = { homeimprovement: "homeimprovement", debtconsolidation: "debtconsolidation",
+                          majorpurchase: "Majorpurchase", other: "other" };
+const AVEN_PROPERTY_TYPE = { "single family home": "Single Family Home", "single family": "Single Family Home",
+                             "multi-family home": "Multi-Family Home", "multi family": "Multi-Family Home",
+                             "condominium": "Condominium", "condo": "Condominium", "townhome": "Townhome" };
+const AVEN_EMPLOYMENT = { employed: "Employed", "not employed": "Not Employed", unemployed: "Not Employed",
+                          "self employed": "Self Employed", "self-employed": "Self Employed",
+                          retired: "Retired", military: "Military", other: "Other" };
+const AVEN_RESIDENCE = { primary: "PRIMARY", secondary: "SECONDARY", investment: "INVESTMENT" };
+
+function _mapEnum(table, v, dflt) {
+  const k = String(v || "").trim().toLowerCase();
+  return table[k] || dflt;
+}
+function _num(v) {
+  const n = Number(String(v == null ? "" : v).replace(/[^0-9.\-]/g, ""));
+  return Number.isFinite(n) ? n : undefined;
+}
+
+app.post("/aven/heloc/:code", express.json(), async (req, res) => {
+  if (req.params.code !== process.env.LEAD_INBOUND_CODE) return res.status(401).send("Unauthorized");
+  if (!AVEN_KEY) return res.status(500).json({ ok: false, error: "AVEN_API_KEY not configured" });
+
+  const f = _coworkExtractAttribution(req.body) || {};
+  const email = String(f.email || "").trim();
+  const phone = String(f.phone || f.phone_number || "").trim();
+
+  // The customer MUST have ticked soft-pull consent. Aven cannot take it later.
+  const consentRaw = String(f.soft_pull_approved || f.softPullApproved || "").trim().toLowerCase();
+  const consented = ["1","true","yes","on","i authorize a soft credit inquiry to check my rate. this will not affect my credit score."]
+                      .includes(consentRaw) || consentRaw.startsWith("i authorize");
+  if (!consented) {
+    console.warn("[aven/heloc] refused — soft pull consent not present for", email || phone);
+    return res.status(400).json({ ok: false, error: "soft_pull_consent_required" });
+  }
+
+  const payload = {
+    leadId: String(f.lead_id || "").trim() || undefined,
+    firstName: f.first_name || undefined,
+    lastName: f.last_name || undefined,
+    email: email || undefined,
+    phone: phone || undefined,
+    dateOfBirth: f.date_of_birth || undefined,
+    propertyAddressStreet: f.property_street || undefined,
+    propertySecondaryAddressUnit: f.property_unit || undefined,
+    propertyCity: f.property_city || undefined,
+    propertyState: String(f.property_state || "FL").trim().toUpperCase().slice(0, 2),
+    propertyAddressPostalCode: f.property_zip || undefined,
+    propertyResidenceType: _mapEnum(AVEN_RESIDENCE, f.property_residence_type, "PRIMARY"),
+    propertyType: _mapEnum(AVEN_PROPERTY_TYPE, f.property_type, undefined),
+    loanUsage: _mapEnum(AVEN_LOAN_USAGE, f.loan_usage, undefined),
+    loanAmount: _num(f.loan_amount),
+    homeValue: f.home_value ? String(f.home_value) : undefined,
+    firstMortgageBalanceAmount: _num(f.first_mortgage_balance),
+    hasSecondMortgage: f.has_second_mortgage ? /^(1|true|yes|on)$/i.test(String(f.has_second_mortgage)) : undefined,
+    annualIncome: _num(f.annual_income),
+    employmentStatus: _mapEnum(AVEN_EMPLOYMENT, f.employment_status, undefined),
+    homeOwnershipStatus: "OWN",
+    creditProfileAmount: _num(f.estimated_credit_score),
+    type: "primary",
+  };
+  Object.keys(payload).forEach(k => payload[k] === undefined && delete payload[k]);
+
+  let r;
+  try { r = await avenFetch("POST", "/thirdPartyLead/create", payload); }
+  catch (e) {
+    console.error("[aven/heloc] call failed:", e && e.message);
+    return res.status(502).json({ ok: false, error: "aven_unreachable" });
+  }
+  console.log("[aven/heloc] create ->", r.status, "email=" + (email || "-"),
+              "body=" + JSON.stringify(r.body).slice(0, 400));
+  if (!r.ok) return res.status(502).json({ ok: false, aven_status: r.status, aven_body: r.body });
+  return res.json({ ok: true, aven_status: r.status, aven: r.body });
+});
+
+// Aven -> us. Payload: {id, type, createdAt, data:{applicationId, applicationUuid, checkpoint, checkpointAt}}
+// The payload carries NO borrower contact, so we read the application list to
+// resolve the borrower's email/phone, then move the Bonzo stage.
+app.post("/aven/webhook/:code", express.json(), async (req, res) => {
+  if (req.params.code !== process.env.LEAD_INBOUND_CODE) return res.status(401).send("Unauthorized");
+  const body = req.body || {};
+  const d = body.data || {};
+  const checkpoint = String(d.checkpoint || "");
+  const appId = d.applicationId;
+  console.log("[aven/webhook] type=" + (body.type || "?") + " appId=" + appId + " checkpoint=" + checkpoint);
+  res.status(200).json({ ok: true });
+  setImmediate(async () => {
+    try {
+      if (!AVEN_COMPLETE_CHECKPOINTS.includes(checkpoint)) {
+        console.log("[aven/webhook] checkpoint not in completion set — no action");
+        return;
+      }
+      const r = await avenFetch("GET", "/atp/applications");
+      if (!r.ok) { console.error("[aven/webhook] applications fetch failed", r.status); return; }
+      const rows = ((r.body || {}).payload || {}).data || [];
+      const app_ = rows.find(a => String(a.applicationId) === String(appId));
+      if (!app_) { console.warn("[aven/webhook] applicationId", appId, "not in scoped list"); return; }
+      const b = app_.borrower || {};
+      await bonzoMoveToAppCompleted(b.email, b.phoneNumber, "AVEN " + checkpoint + " appId=" + appId);
+    } catch (e) {
+      console.error("[aven/webhook] error:", e && e.stack || e);
+    }
+  });
+});
+
+app.get("/aven/status/:code", async (req, res) => {
+  if (req.params.code !== process.env.LEAD_INBOUND_CODE) return res.status(401).send("Unauthorized");
+  const r = await avenFetch("GET", "/atp/applications");
+  const rows = ((r.body || {}).payload || {}).data || [];
+  return res.json({
+    ok: r.ok, aven_status: r.status, key_configured: !!AVEN_KEY,
+    app_completed_stage_id: APP_COMPLETED_STAGE_ID,
+    completion_checkpoints: AVEN_COMPLETE_CHECKPOINTS,
+    applications: rows.map(a => ({ id: a.applicationId, stage: a.applicationStage, createdAt: a.createdAt })),
+  });
+});
+// === END APPLICATION COMPLETED + AVEN HELOC =========================
 
 app.listen(process.env.PORT || 3000, () => {
   console.log("Server running");
