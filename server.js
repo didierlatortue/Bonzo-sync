@@ -4384,8 +4384,26 @@ app.post("/aven/heloc/:code", express.json(), async (req, res) => {
 // Aven -> us. Payload: {id, type, createdAt, data:{applicationId, applicationUuid, checkpoint, checkpointAt}}
 // The payload carries NO borrower contact, so we read the application list to
 // resolve the borrower's email/phone, then move the Bonzo stage.
-app.post("/aven/webhook/:code", express.json(), async (req, res) => {
+const AVEN_WEBHOOK_SECRET = process.env.AVEN_WEBHOOK_SECRET || "";
+const _avenRaw = express.json({ verify: (req, _res, buf) => { req.rawBody = buf; } });
+function avenSignatureOk(req) {
+  if (!AVEN_WEBHOOK_SECRET) return true; // not configured -> path code is the only guard
+  const sent = req.header("x-aven-signature") || req.header("X-Aven-Signature") || "";
+  if (!sent) { console.warn("[aven/webhook] no x-aven-signature header"); return false; }
+  try {
+    const crypto = require("crypto");
+    const mac = crypto.createHmac("sha256", AVEN_WEBHOOK_SECRET)
+                      .update(req.rawBody || Buffer.from(JSON.stringify(req.body || {})))
+                      .digest("hex");
+    const a = Buffer.from(mac, "utf8");
+    const b = Buffer.from(String(sent).trim().replace(/^sha256=/, ""), "utf8");
+    return a.length === b.length && crypto.timingSafeEqual(a, b);
+  } catch (e) { console.error("[aven/webhook] sig check error:", e && e.message); return false; }
+}
+
+app.post("/aven/webhook/:code", _avenRaw, async (req, res) => {
   if (req.params.code !== process.env.LEAD_INBOUND_CODE) return res.status(401).send("Unauthorized");
+  if (!avenSignatureOk(req)) return res.status(401).send("Unauthorized (signature)");
   const body = req.body || {};
   const d = body.data || {};
   const checkpoint = String(d.checkpoint || "");
@@ -4419,6 +4437,7 @@ app.get("/aven/status/:code", async (req, res) => {
     ok: r.ok, aven_status: r.status, key_configured: !!AVEN_KEY,
     app_completed_stage_id: APP_COMPLETED_STAGE_ID,
     completion_checkpoints: AVEN_COMPLETE_CHECKPOINTS,
+    webhook_secret_configured: !!AVEN_WEBHOOK_SECRET,
     applications: rows.map(a => ({ id: a.applicationId, stage: a.applicationStage, createdAt: a.createdAt })),
   });
 });
