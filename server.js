@@ -4290,7 +4290,7 @@ app.post("/arive/app-completed/:code", express.json(), async (req, res) => {
 
 // ---------------------------------------------------------------------
 // TASK 2 — AVEN HELOC
-// (a) /aven/heloc/:code   website form  -> POST /thirdPartyLead/create
+// (a) /aven/heloc/:code   website form  -> POST /atp/application/start
 // (b) /aven/webhook/:code Aven checkpoint -> look up borrower -> stage move
 // ---------------------------------------------------------------------
 async function avenFetch(method, path, body, extraHeaders) {
