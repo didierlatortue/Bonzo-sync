@@ -1835,6 +1835,60 @@ app.post("/lead/inbound/:code", (req, res) => {
 });
 // === END COWORK PATCH ===
 
+// === COWORK 2026-11-12: /contact/inbound/:code — "Turtur Home Loans Contact us form" (/contact/ page) ===
+// Owner request: send the person's name + email into Bonzo as a NEW contact.
+// - Creates a prospect with first_name, last_name, email, lead_source only. No stage, no campaign, no tags.
+// - If a prospect with that email already exists: writes NOTHING (owner rule 2026-10-11:
+//   automations must not change any existing lead's info).
+// - lead_source does not match TURTUR_ROUTING_LEAD_SOURCE_RE, so /leads/reconcile-unrouted never stages it.
+// - ACKs immediately so Elementor's ~5s webhook timeout never shows the visitor an error.
+const TURTUR_CONTACT_FORM_SOURCE = "Turtur Home Loans Contact us form";
+async function _coworkContactToBonzo(flat) {
+  const email = String(flat.email || "").trim().toLowerCase();
+  let first = String(flat.first_name || "").trim();
+  let last = String(flat.last_name || "").trim();
+  if (!first && flat.name) {
+    const parts = String(flat.name).trim().split(/\s+/);
+    first = parts.shift() || "";
+    last = parts.join(" ");
+  }
+  if (!email || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) {
+    console.log("[contact/inbound] skipped: no valid email");
+    return { ok: false, skipped: "no_valid_email" };
+  }
+  const s = await bonzoFetch("/prospects?search=" + encodeURIComponent(email) + "&per_page=10", { method: "GET" });
+  if (!s || !s.ok) {
+    console.error("[contact/inbound] search failed status=" + (s && s.status) + " — not creating (avoids duplicates)");
+    return { ok: false, error: "search_failed", status: s && s.status };
+  }
+  const hits = ((s.json && s.json.data) || []).filter(p => String(p.email || "").trim().toLowerCase() === email);
+  if (hits.length) {
+    console.log("[contact/inbound] exists, no change prospect=" + hits[0].id);
+    return { ok: true, action: "exists_no_change", prospect_id: hits[0].id };
+  }
+  const body = { email: email, lead_source: TURTUR_CONTACT_FORM_SOURCE };
+  if (first) body.first_name = first;
+  if (last) body.last_name = last;
+  const c = await bonzoFetch("/prospects", { method: "POST", body: JSON.stringify(body) });
+  const id = c && c.json && ((c.json.data && c.json.data.id) || c.json.id);
+  console.log("[contact/inbound] create status=" + (c && c.status) + " prospect=" + id);
+  return { ok: !!(c && c.ok), action: "created", prospect_id: id, status: c && c.status };
+}
+app.post("/contact/inbound/:code", (req, res) => {
+  if (req.params.code !== process.env.LEAD_INBOUND_CODE) return res.status(401).send("Unauthorized");
+  let flat = {};
+  try { flat = _coworkExtractAttribution(req.body || {}); } catch (e) { flat = {}; }
+  if (String(req.query.wait || "") === "1") {
+    return _coworkContactToBonzo(flat)
+      .then(r => res.json(r))
+      .catch(e => res.status(500).json({ ok: false, error: e && e.message }));
+  }
+  res.json({ ok: true, accepted: true });
+  setImmediate(() => _coworkContactToBonzo(flat).catch(e =>
+    console.error("[contact/inbound] async error:", e && e.stack || e)));
+});
+// === END COWORK 2026-11-12 contact form ===
+
 
 // === COWORK 2026-04-29: /calendly endpoint — Calendly invitee.created webhook ===
 function _coworkExtractCalendly(body) {
